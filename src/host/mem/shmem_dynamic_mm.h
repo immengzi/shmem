@@ -64,7 +64,7 @@ private:
     bool try_expand_existing_block(dynamic_memory_block* block, uint64_t required_size) noexcept;
     dynamic_memory_block* create_new_block(uint64_t min_size) noexcept;
     void* allocate_from_block(dynamic_memory_block* block, uint64_t size) noexcept;
-    bool release_to_block(dynamic_memory_block* block, void* address) noexcept;
+    bool release_to_block(dynamic_memory_block* block, void* address, uint64_t size) noexcept;
     void update_block_statistics(dynamic_memory_block* block, int64_t size_delta) noexcept;
 
 private:
@@ -75,6 +75,9 @@ private:
     // 动态内存块管理
     std::vector<std::unique_ptr<dynamic_memory_block>> memory_blocks_;
     std::map<void*, dynamic_memory_block*> address_to_block_map_;
+    
+    // 外部内存块分配大小映射（用于准确统计和释放）
+    std::map<void*, uint64_t> external_alloc_size_map_;
     
     // 统计信息
     uint64_t total_allocated_;
