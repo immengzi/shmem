@@ -199,9 +199,11 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
                 if (aligned_start + aligned_size <= block_start + block->size) {
                     aligned_ptr = aligned_start;
                     uint64_t padding_size = aligned_start - (block_start + block->used_size);
-                    block->used_size += padding_size + aligned_size;
+                    uint64_t total_size = padding_size + aligned_size;
+                    block->used_size += total_size;
                     address_to_block_map_[aligned_ptr] = block.get();
-                    external_alloc_size_map_[aligned_ptr] = aligned_size;  // 记录实际分配大小
+                    // 记录分配信息：<数据大小, 总大小（包含padding）>
+                    external_alloc_info_map_[aligned_ptr] = {aligned_size, total_size};
                     update_block_statistics(block.get(), aligned_size);
                     pthread_spin_unlock(&spinlock_);
                     
@@ -276,26 +278,30 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
         dynamic_memory_block* block = it->second;
         
         // 获取准确的分配大小进行统计修正
-        auto size_it = external_alloc_size_map_.find(address);
-        uint64_t alloc_size = (size_it != external_alloc_size_map_.end()) ? 
-                              size_it->second : allocated_size_align_up(1);
+        auto info_it = external_alloc_info_map_.find(address);
+        uint64_t data_size = allocated_size_align_up(1);  // 默认使用对齐后的最小大小
+        uint64_t total_size = data_size;
         
-        address_to_block_map_.erase(it);
-        if (size_it != external_alloc_size_map_.end()) {
-            external_alloc_size_map_.erase(size_it);
+        if (info_it != external_alloc_info_map_.end()) {
+            data_size = info_it->second.first;
+            total_size = info_it->second.second;
+            external_alloc_info_map_.erase(info_it);
         }
         
-        // 更新块的使用统计
-        if (block->used_size >= alloc_size) {
-            block->used_size -= alloc_size;
+        address_to_block_map_.erase(it);
+        
+        // 更新块的使用统计（减去包含padding的总大小）
+        if (block->used_size >= total_size) {
+            block->used_size -= total_size;
         } else {
             block->used_size = 0;  // 防止下溢
         }
         
-        update_block_statistics(block, -static_cast<int64_t>(alloc_size));
+        update_block_statistics(block, -static_cast<int64_t>(data_size));
         
         pthread_spin_unlock(&spinlock_);
-        SHM_LOG_DEBUG("Released memory at " << address << " (size: " << alloc_size << ") from dynamic block");
+        SHM_LOG_DEBUG("Released memory at " << address << " (data: " << data_size 
+                      << ", total: " << total_size << ") from dynamic block");
         return 0;
     }
     
@@ -411,7 +417,8 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     
     block->used_size += size;
     address_to_block_map_[allocated_addr] = block;
-    external_alloc_size_map_[allocated_addr] = size;  // 记录分配大小用于准确统计
+    // 记录分配信息：<数据大小, 总大小（无padding时等于数据大小）>
+    external_alloc_info_map_[allocated_addr] = {size, size};
     update_block_statistics(block, size);
     
     return allocated_addr;

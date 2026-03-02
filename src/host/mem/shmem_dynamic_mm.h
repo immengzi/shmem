@@ -77,7 +77,8 @@ private:
     std::map<void*, dynamic_memory_block*> address_to_block_map_;
     
     // 外部内存块分配大小映射（用于准确统计和释放）
-    std::map<void*, uint64_t> external_alloc_size_map_;
+    // key: 分配的指针, value: pair<实际分配大小, 包含padding的总大小>
+    std::map<void*, std::pair<uint64_t, uint64_t>> external_alloc_info_map_;
     
     // 统计信息
     uint64_t total_allocated_;
