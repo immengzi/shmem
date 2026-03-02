@@ -371,13 +371,33 @@ uint64_t dynamic_memory_manager::get_available_memory() const noexcept {
 void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
     pthread_spin_lock(&spinlock_);
     
-    // 清理完全空闲的外部内存块（used_size == 0）
+    uint64_t freed_count = 0;
+    uint64_t freed_size = 0;
+    
+    // 清理完全空闲的外部内存块（used_size == 0 且没有活跃分配）
     for (auto it = memory_blocks_.begin(); it != memory_blocks_.end();) {
         auto& block = *it;
         if (block->is_external && block->used_size == 0) {
+            // 检查是否还有未释放的分配（双重检查）
+            bool has_active_alloc = false;
+            for (const auto& pair : address_to_block_map_) {
+                if (pair.second == block.get()) {
+                    has_active_alloc = true;
+                    break;
+                }
+            }
+            
+            if (has_active_alloc) {
+                SHM_LOG_WARN("Block at " << block->base_addr << " has used_size=0 but active allocations exist");
+                ++it;
+                continue;
+            }
+            
             // 释放 CANN 内存
             if (block->base_addr != nullptr) {
                 aclrtFree(block->base_addr);
+                freed_size += block->size;
+                freed_count++;
                 SHM_LOG_INFO("Freed unused external memory block: " << block->base_addr 
                              << " (size: " << block->size << ")");
             }
@@ -385,7 +405,7 @@ void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
             // 更新总容量
             total_capacity_ -= block->size;
             
-            // 从 vector 中移除（vector 不支持 erase，需要 swap-pop）
+            // 从 vector 中移除
             it = memory_blocks_.erase(it);
         } else {
             ++it;
@@ -394,8 +414,14 @@ void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
     
     pthread_spin_unlock(&spinlock_);
     
-    SHM_LOG_INFO("Memory cleanup completed. Current capacity: " << total_capacity_ 
-                 << ", allocated: " << total_allocated_);
+    if (freed_count > 0) {
+        SHM_LOG_INFO("Memory cleanup completed. Freed " << freed_count << " blocks (" 
+                     << freed_size << " bytes). Current capacity: " << total_capacity_ 
+                     << ", allocated: " << total_allocated_);
+    } else {
+        SHM_LOG_DEBUG("Memory cleanup completed. No blocks freed. Current capacity: " 
+                      << total_capacity_ << ", allocated: " << total_allocated_);
+    }
 }
 
 // 私有辅助函数实现
