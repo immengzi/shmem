@@ -351,6 +351,36 @@ uint64_t dynamic_memory_manager::get_available_memory() const noexcept {
     return total_capacity_ - total_allocated_;
 }
 
+void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
+    pthread_spin_lock(&spinlock_);
+    
+    // 清理完全空闲的外部内存块（used_size == 0）
+    for (auto it = memory_blocks_.begin(); it != memory_blocks_.end();) {
+        auto& block = *it;
+        if (block->is_external && block->used_size == 0) {
+            // 释放 CANN 内存
+            if (block->base_addr != nullptr) {
+                aclrtFree(block->base_addr);
+                SHM_LOG_INFO("Freed unused external memory block: " << block->base_addr 
+                             << " (size: " << block->size << ")");
+            }
+            
+            // 更新总容量
+            total_capacity_ -= block->size;
+            
+            // 从 vector 中移除（vector 不支持 erase，需要 swap-pop）
+            it = memory_blocks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    
+    pthread_spin_unlock(&spinlock_);
+    
+    SHM_LOG_INFO("Memory cleanup completed. Current capacity: " << total_capacity_ 
+                 << ", allocated: " << total_allocated_);
+}
+
 // 私有辅助函数实现
 dynamic_memory_block* dynamic_memory_manager::find_suitable_block(uint64_t size) noexcept {
     // 查找有足够空间的外部内存块
