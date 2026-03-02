@@ -230,7 +230,40 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
     
     pthread_spin_lock(&spinlock_);
     
-    // 检查是否在初始内存池中
+    // 1. 首先检查是否在动态内存块中（优先检查，避免地址范围重叠误判）
+    auto it = address_to_block_map_.find(address);
+    if (it != address_to_block_map_.end()) {
+        dynamic_memory_block* block = it->second;
+        
+        // 获取准确的分配大小进行统计修正
+        auto info_it = external_alloc_info_map_.find(address);
+        uint64_t data_size = allocated_size_align_up(1);  // 默认使用对齐后的最小大小
+        uint64_t total_size = data_size;
+        
+        if (info_it != external_alloc_info_map_.end()) {
+            data_size = info_it->second.first;
+            total_size = info_it->second.second;
+            external_alloc_info_map_.erase(info_it);
+        }
+        
+        address_to_block_map_.erase(it);
+        
+        // 更新块的使用统计（减去包含padding的总大小）
+        if (block->used_size >= total_size) {
+            block->used_size -= total_size;
+        } else {
+            block->used_size = 0;  // 防止下溢
+        }
+        
+        update_block_statistics(block, -static_cast<int64_t>(data_size));
+        
+        pthread_spin_unlock(&spinlock_);
+        SHM_LOG_DEBUG("Released memory at " << address << " (data: " << data_size 
+                      << ", total: " << total_size << ") from dynamic block");
+        return 0;
+    }
+    
+    // 2. 检查是否在初始内存池中（使用精确的偏移量查找）
     if (u8a >= initial_base_ && u8a < initial_base_ + initial_size_) {
         auto offset = u8a - initial_base_;
         auto pos = address_used_tree_.find(offset);
@@ -273,39 +306,7 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
         }
     }
     
-    // 检查是否在动态内存块中
-    auto it = address_to_block_map_.find(address);
-    if (it != address_to_block_map_.end()) {
-        dynamic_memory_block* block = it->second;
-        
-        // 获取准确的分配大小进行统计修正
-        auto info_it = external_alloc_info_map_.find(address);
-        uint64_t data_size = allocated_size_align_up(1);  // 默认使用对齐后的最小大小
-        uint64_t total_size = data_size;
-        
-        if (info_it != external_alloc_info_map_.end()) {
-            data_size = info_it->second.first;
-            total_size = info_it->second.second;
-            external_alloc_info_map_.erase(info_it);
-        }
-        
-        address_to_block_map_.erase(it);
-        
-        // 更新块的使用统计（减去包含padding的总大小）
-        if (block->used_size >= total_size) {
-            block->used_size -= total_size;
-        } else {
-            block->used_size = 0;  // 防止下溢
-        }
-        
-        update_block_statistics(block, -static_cast<int64_t>(data_size));
-        
-        pthread_spin_unlock(&spinlock_);
-        SHM_LOG_DEBUG("Released memory at " << address << " (data: " << data_size 
-                      << ", total: " << total_size << ") from dynamic block");
-        return 0;
-    }
-    
+    // 地址未找到
     pthread_spin_unlock(&spinlock_);
     SHM_LOG_ERROR("Release invalid address " << address);
     return -1;
