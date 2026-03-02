@@ -425,7 +425,16 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
 }
 
 void dynamic_memory_manager::update_block_statistics(dynamic_memory_block* block, int64_t size_delta) noexcept {
-    total_allocated_ += size_delta;
+    // 检查下溢：当 size_delta 为负且绝对值大于当前值时
+    if (size_delta < 0 && static_cast<uint64_t>(-size_delta) > total_allocated_) {
+        SHM_LOG_WARN("Memory allocation underflow detected: delta=" << size_delta 
+                     << ", current=" << total_allocated_);
+        total_allocated_ = 0;
+    } else {
+        total_allocated_ += size_delta;
+    }
+    
+    // 检查上溢：使用量超过总容量
     if (total_allocated_ > total_capacity_) {
         SHM_LOG_WARN("Memory usage exceeds capacity: " << total_allocated_ << " > " << total_capacity_);
     }
