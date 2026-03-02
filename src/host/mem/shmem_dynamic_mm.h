@@ -56,15 +56,9 @@ private:
     static uint64_t allocated_size_align_up(uint64_t input_size) noexcept;
     static bool alignment_matches(const memory_range &mr, uint64_t alignment, uint64_t size,
                                   uint64_t &head_skip) noexcept;
-    void reduce_size_in_lock(const std::map<uint64_t, uint64_t>::iterator &pos, uint64_t new_size) noexcept;
-    bool expend_size_in_lock(const std::map<uint64_t, uint64_t>::iterator &pos, uint64_t new_size) noexcept;
-    
     // 动态扩容辅助函数
     dynamic_memory_block* find_suitable_block(uint64_t size) noexcept;
-    bool try_expand_existing_block(dynamic_memory_block* block, uint64_t required_size) noexcept;
-    dynamic_memory_block* create_new_block(uint64_t min_size) noexcept;
     void* allocate_from_block(dynamic_memory_block* block, uint64_t size) noexcept;
-    bool release_to_block(dynamic_memory_block* block, void* address, uint64_t size) noexcept;
     void update_block_statistics(dynamic_memory_block* block, int64_t size_delta) noexcept;
 
 private:
