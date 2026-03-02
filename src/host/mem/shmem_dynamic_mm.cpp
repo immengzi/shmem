@@ -106,8 +106,8 @@ void *dynamic_memory_manager::allocate(uint64_t size) noexcept {
     }
     
     // 3. 如果找不到合适的块，尝试扩容
+    // 注意：expand_pool 内部会先解锁，分配内存后再加锁更新元数据
     if (!expand_pool(aligned_size)) {
-        pthread_spin_unlock(&spinlock_);
         SHM_LOG_ERROR("Failed to expand memory pool for size: " << size);
         return nullptr;
     }
@@ -305,6 +305,10 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
 }
 
 bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
+    // 注意：此函数假设调用者已持有 spinlock_
+    // 先解锁，避免长时间持有锁进行内存分配
+    pthread_spin_unlock(&spinlock_);
+    
     // 计算需要的扩容大小
     uint64_t expansion_size = std::max(required_size, MIN_EXPANSION_SIZE);
     expansion_size = static_cast<uint64_t>(expansion_size * EXPANSION_FACTOR);
@@ -316,15 +320,20 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
     
-    // 使用CANN接口分配新的内存块
+    // 使用CANN接口分配新的内存块（此时不持有锁，允许其他线程并行）
     void* new_block_addr = nullptr;
     aclError ret = aclrtMalloc(&new_block_addr, expansion_size, ACL_MEM_MALLOC_HUGE_FIRST);
     
     if (ret != ACL_SUCCESS || new_block_addr == nullptr) {
         SHM_LOG_ERROR("Failed to allocate external memory block of size " << expansion_size 
                       << ", error code: " << ret);
+        // 重新加锁，保持锁状态一致性
+        pthread_spin_lock(&spinlock_);
         return false;
     }
+    
+    // 内存分配成功，重新加锁更新元数据
+    pthread_spin_lock(&spinlock_);
     
     // 创建新的内存块管理结构
     auto new_block = std::make_unique<dynamic_memory_block>(new_block_addr, expansion_size, true);
