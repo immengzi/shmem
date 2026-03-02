@@ -108,6 +108,7 @@ void *dynamic_memory_manager::allocate(uint64_t size) noexcept {
     // 3. 如果找不到合适的块，尝试扩容
     // 注意：expand_pool 内部会先解锁，分配内存后再加锁更新元数据
     if (!expand_pool(aligned_size)) {
+        pthread_spin_unlock(&spinlock_);  // 必须先解锁再返回
         SHM_LOG_ERROR("Failed to expand memory pool for size: " << size);
         return nullptr;
     }
