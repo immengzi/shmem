@@ -13,7 +13,7 @@
 #include <chrono>
 #include <thread>
 #include "acl/acl.h"
-#include "shmem/host/mem/aclshmem_mem.h"
+#include "shmem.h"
 
 class DynamicMemoryTest {
 private:
@@ -23,31 +23,38 @@ public:
     DynamicMemoryTest() : initialized_(false) {}
     
     bool initialize() {
-        // 初始化ACL
         aclError ret = aclInit(nullptr);
         if (ret != ACL_SUCCESS) {
             std::cerr << "Failed to initialize ACL: " << ret << std::endl;
             return false;
         }
         
-        // 设置设备
         ret = aclrtSetDevice(0);
         if (ret != ACL_SUCCESS) {
             std::cerr << "Failed to set device: " << ret << std::endl;
             return false;
         }
         
-        // 初始化SHMEM（小内存池用于测试扩容）
-        aclshmemx_init_attr_t attr = {0};
-        attr.version = 1;
-        attr.my_rank = 0;
-        attr.n_ranks = 1;
-        attr.local_mem_size = 32 * 1024 * 1024; // 32MB初始内存池
-        
-        // 启用动态扩容
+        // 启用动态扩容（必须在init之前调用）
         aclshmem_enable_dynamic_expansion(true);
+
+        // 用 UniqueID 方式初始化
+        aclshmemx_uniqueid_t uid;
+        aclshmemx_init_attr_t attributes;
         
-        ret = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr);
+        ret = aclshmemx_get_uniqueid(&uid);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "Failed to get unique id: " << ret << std::endl;
+            return false;
+        }
+        
+        ret = aclshmemx_set_attr_uniqueid_args(0, 1, 32 * 1024 * 1024, &uid, &attributes);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "Failed to set attr: " << ret << std::endl;
+            return false;
+        }
+        
+        ret = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes);
         if (ret != ACL_SUCCESS) {
             std::cerr << "Failed to initialize SHMEM: " << ret << std::endl;
             return false;
@@ -110,50 +117,58 @@ public:
     
     bool testLargeAllocation() {
         std::cout << "\n=== Testing Large Single Allocation ===" << std::endl;
-        
         printMemoryStats("Before allocation: ");
-        
+
         size_t large_size_mb = 100; // 100MB
         size_t large_size_bytes = large_size_mb * 1024 * 1024;
-        
+
         std::cout << "Attempting to allocate " << large_size_mb << " MB block..." << std::endl;
-        
+
         auto start_time = std::chrono::high_resolution_clock::now();
         void* large_ptr = aclshmem_malloc(large_size_bytes);
         auto end_time = std::chrono::high_resolution_clock::now();
-        
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        
+
         if (large_ptr) {
-            std::cout << "✓ Large allocation successful! Pointer: " << large_ptr 
-                     << ", Time: " << duration.count() << " μs" << std::endl;
+            std::cout << "✓ Large allocation successful! Pointer: " << large_ptr
+                    << ", Time: " << duration.count() << " μs" << std::endl;
             printMemoryStats("After allocation: ");
-            
-            // 写入测试数据
-            std::cout << "Writing test data to allocated memory..." << std::endl;
-            float* float_ptr = static_cast<float*>(large_ptr);
-            size_t float_count = large_size_bytes / sizeof(float);
-            
-            for (size_t i = 0; i < std::min(size_t(1000), float_count); i++) {
-                float_ptr[i] = static_cast<float>(i);
+
+            // 准备 host 侧数据
+            size_t check_count = 1000;
+            float* host_src = nullptr;
+            aclrtMallocHost(reinterpret_cast<void**>(&host_src), check_count * sizeof(float));
+            for (size_t i = 0; i < check_count; i++) {
+                host_src[i] = static_cast<float>(i);
             }
-            
-            // 验证数据
+
+            // host -> device
+            std::cout << "Writing test data to allocated memory..." << std::endl;
+            aclrtMemcpy(large_ptr, check_count * sizeof(float),
+                        host_src, check_count * sizeof(float),
+                        ACL_MEMCPY_HOST_TO_DEVICE);
+
+            // device -> host 验证
+            float* host_dst = nullptr;
+            aclrtMallocHost(reinterpret_cast<void**>(&host_dst), check_count * sizeof(float));
+            aclrtMemcpy(host_dst, check_count * sizeof(float),
+                        large_ptr, check_count * sizeof(float),
+                        ACL_MEMCPY_DEVICE_TO_HOST);
+
             bool data_correct = true;
-            for (size_t i = 0; i < std::min(size_t(100), float_count); i++) {
-                if (float_ptr[i] != static_cast<float>(i)) {
+            for (size_t i = 0; i < check_count; i++) {
+                if (host_dst[i] != static_cast<float>(i)) {
                     data_correct = false;
                     break;
                 }
             }
-            
             std::cout << "Data verification: " << (data_correct ? "PASSED" : "FAILED") << std::endl;
-            
-            // 释放内存
+
+            aclrtFreeHost(host_src);
+            aclrtFreeHost(host_dst);
             aclshmem_free(large_ptr);
             printMemoryStats("After cleanup: ");
-            
-            return true;
+            return data_correct;
         } else {
             std::cout << "✗ Large allocation failed!" << std::endl;
             return false;

@@ -30,6 +30,7 @@
 
 #include "host/shmem_host_def.h"
 #include "host/mem/shmem_host_heap.h"
+#include "host/mem/shmem_host_dynamic_mem.h"
 #include "host/init/shmem_host_init.h"
 #include "host/data_plane/shmem_host_rma.h"
 #include "host/data_plane/shmem_host_so.h"
