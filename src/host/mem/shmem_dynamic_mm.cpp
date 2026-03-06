@@ -182,37 +182,58 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
         return result;
     }
     
-    // 在动态块中查找对齐分配
+    // 在动态块中查找对齐分配（使用 high_water 作为 bump 指针，避免与释放后的分配重叠）
     for (auto& block : memory_blocks_) {
-        if (block->is_external) {
-            // 对于外部内存块，使用CANN的对齐分配
-            void* aligned_ptr = nullptr;
-            uint64_t actual_size = aligned_size + alignment - 1;
-            
-            // 这里简化处理，实际应该更精确地管理对齐内存
-            if (block->size - block->used_size >= actual_size) {
-                // 简化的对齐分配逻辑
-                uint8_t* block_start = static_cast<uint8_t*>(block->base_addr);
-                uint8_t* aligned_start = reinterpret_cast<uint8_t*>(
-                    (reinterpret_cast<uintptr_t>(block_start + block->used_size) + alignment - 1) & 
-                    ~(alignment - 1));
-                
-                if (aligned_start + aligned_size <= block_start + block->size) {
-                    aligned_ptr = aligned_start;
-                    uint64_t padding_size = aligned_start - (block_start + block->used_size);
-                    uint64_t total_size = padding_size + aligned_size;
-                    block->used_size += total_size;
-                    address_to_block_map_[aligned_ptr] = block.get();
-                    // 记录分配信息：<数据大小, 总大小（包含padding）>
-                    external_alloc_info_map_[aligned_ptr] = {aligned_size, total_size};
-                    update_block_statistics(block.get(), aligned_size);
-                    pthread_spin_unlock(&spinlock_);
-                    
-                    SHM_LOG_DEBUG("Aligned allocated " << size << " bytes (padding: " << padding_size 
-                                  << ") from dynamic block at " << aligned_ptr);
-                    return aligned_ptr;
+        if (!block->is_external) continue;
+
+        uint8_t* block_start = static_cast<uint8_t*>(block->base_addr);
+
+        // 先尝试从空闲槽位中找到合适的对齐槽
+        auto& slots = block->free_slots;
+        bool slot_found = false;
+        for (auto it = slots.begin(); it != slots.end(); ++it) {
+            uint8_t* slot_ptr = block_start + it->first;
+            uint8_t* aligned_start = reinterpret_cast<uint8_t*>(
+                (reinterpret_cast<uintptr_t>(slot_ptr) + alignment - 1) & ~(alignment - 1));
+            uint64_t padding_size = static_cast<uint64_t>(aligned_start - slot_ptr);
+            uint64_t total_size = padding_size + aligned_size;
+            if (it->second >= total_size) {
+                uint64_t remaining = it->second - total_size;
+                uint64_t slot_offset = it->first;
+                if (remaining > 0) {
+                    *it = {slot_offset + total_size, remaining};
+                } else {
+                    slots.erase(it);
                 }
+                address_to_block_map_[aligned_start] = block.get();
+                external_alloc_info_map_[aligned_start] = {aligned_size, total_size};
+                block->used_size += aligned_size;
+                update_block_statistics(block.get(), aligned_size);
+                pthread_spin_unlock(&spinlock_);
+                SHM_LOG_DEBUG("Aligned allocated " << size << " bytes (slot, padding: "
+                              << padding_size << ") from dynamic block at " << (void*)aligned_start);
+                return aligned_start;
             }
+        }
+        if (slot_found) continue;
+
+        // 从 bump 区域分配（high_water 只增不减，避免重叠）
+        uint8_t* bump_ptr = block_start + block->high_water;
+        uint8_t* aligned_start = reinterpret_cast<uint8_t*>(
+            (reinterpret_cast<uintptr_t>(bump_ptr) + alignment - 1) & ~(alignment - 1));
+        uint64_t padding_size = static_cast<uint64_t>(aligned_start - bump_ptr);
+        uint64_t total_size = padding_size + aligned_size;
+
+        if (block->high_water + total_size <= block->size) {
+            block->high_water += total_size;
+            block->used_size += aligned_size;
+            address_to_block_map_[aligned_start] = block.get();
+            external_alloc_info_map_[aligned_start] = {aligned_size, total_size};
+            update_block_statistics(block.get(), aligned_size);
+            pthread_spin_unlock(&spinlock_);
+            SHM_LOG_DEBUG("Aligned allocated " << size << " bytes (bump, padding: "
+                          << padding_size << ") from dynamic block at " << (void*)aligned_start);
+            return aligned_start;
         }
     }
     
@@ -234,32 +255,65 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
     auto it = address_to_block_map_.find(address);
     if (it != address_to_block_map_.end()) {
         dynamic_memory_block* block = it->second;
-        
+
         // 获取准确的分配大小进行统计修正
         auto info_it = external_alloc_info_map_.find(address);
         uint64_t data_size = allocated_size_align_up(1);  // 默认使用对齐后的最小大小
         uint64_t total_size = data_size;
-        
+
         if (info_it != external_alloc_info_map_.end()) {
             data_size = info_it->second.first;
             total_size = info_it->second.second;
             external_alloc_info_map_.erase(info_it);
         }
-        
+
         address_to_block_map_.erase(it);
-        
-        // 更新块的使用统计（减去包含padding的总大小）
+
+        // 更新活跃分配统计（used_size 只用于统计，不作为 bump 指针）
         if (block->used_size >= total_size) {
             block->used_size -= total_size;
         } else {
             block->used_size = 0;  // 防止下溢
         }
-        
+
+        // 将归还的区域加入空闲槽位列表，供后续 best-fit 复用
+        // high_water 保持不变，只有 bump 区域未分配时才回退
+        uint64_t freed_offset = static_cast<uint64_t>(
+            static_cast<uint8_t*>(address) -
+            static_cast<uint8_t*>(block->base_addr));
+
+        // 尝试与相邻空闲槽合并，减少碎片
+        auto& slots = block->free_slots;
+        slots.push_back({freed_offset, total_size});
+        // 按 offset 排序后合并相邻/重叠的槽
+        std::sort(slots.begin(), slots.end());
+        std::vector<std::pair<uint64_t, uint64_t>> merged;
+        for (const auto& s : slots) {
+            if (!merged.empty() &&
+                merged.back().first + merged.back().second >= s.first) {
+                // 合并：扩展上一个槽的大小
+                uint64_t new_end = std::max(merged.back().first + merged.back().second,
+                                            s.first + s.second);
+                merged.back().second = new_end - merged.back().first;
+            } else {
+                merged.push_back(s);
+            }
+        }
+        // 如果末尾空闲槽紧贴 high_water，将 high_water 回退以释放 bump 空间
+        if (!merged.empty() &&
+            merged.back().first + merged.back().second == block->high_water) {
+            block->high_water = merged.back().first;
+            merged.pop_back();
+        }
+        slots = std::move(merged);
+
         update_block_statistics(block, -static_cast<int64_t>(data_size));
-        
+
         pthread_spin_unlock(&spinlock_);
-        SHM_LOG_DEBUG("Released memory at " << address << " (data: " << data_size 
-                      << ", total: " << total_size << ") from dynamic block");
+        SHM_LOG_DEBUG("Released memory at " << address << " (data: " << data_size
+                      << ", total: " << total_size << ") from dynamic block, "
+                      << "free_slots=" << block->free_slots.size()
+                      << " high_water=" << block->high_water);
         return 0;
     }
     
@@ -377,7 +431,7 @@ void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
     // 清理完全空闲的外部内存块（used_size == 0 且没有活跃分配）
     for (auto it = memory_blocks_.begin(); it != memory_blocks_.end();) {
         auto& block = *it;
-        if (block->is_external && block->used_size == 0) {
+        if (block->is_external && block->used_size == 0 && block->free_slots.empty()) {
             // 检查是否还有未释放的分配（双重检查）
             bool has_active_alloc = false;
             for (const auto& pair : address_to_block_map_) {
@@ -426,9 +480,17 @@ void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
 
 // 私有辅助函数实现
 dynamic_memory_block* dynamic_memory_manager::find_suitable_block(uint64_t size) noexcept {
-    // 查找有足够空间的外部内存块
+    // 优先从空闲槽位中寻找合适的外部块（best-fit 复用已归还的段）
     for (auto& block : memory_blocks_) {
-        if (block->is_external && (block->size - block->used_size) >= size) {
+        if (!block->is_external) continue;
+        // 检查空闲槽位
+        for (const auto& slot : block->free_slots) {
+            if (slot.second >= size) {
+                return block.get();
+            }
+        }
+        // 检查 bump 区域剩余空间
+        if ((block->size - block->high_water) >= size) {
             return block.get();
         }
     }
@@ -439,16 +501,49 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     if (!block->is_external) {
         return nullptr; // 初始内存池不应该通过此函数分配
     }
-    
+
     uint8_t* block_start = static_cast<uint8_t*>(block->base_addr);
-    void* allocated_addr = block_start + block->used_size;
-    
+    void* allocated_addr = nullptr;
+
+    // 优先复用空闲槽位（best-fit：找到能满足需求的最小槽）
+    auto best_it = block->free_slots.end();
+    uint64_t best_size = UINT64_MAX;
+    for (auto it = block->free_slots.begin(); it != block->free_slots.end(); ++it) {
+        if (it->second >= size && it->second < best_size) {
+            best_size = it->second;
+            best_it = it;
+        }
+    }
+
+    if (best_it != block->free_slots.end()) {
+        uint64_t slot_offset = best_it->first;
+        uint64_t slot_size   = best_it->second;
+        // 如果槽比请求大，将剩余部分放回空闲列表
+        if (slot_size > size) {
+            *best_it = {slot_offset + size, slot_size - size};
+        } else {
+            block->free_slots.erase(best_it);
+        }
+        allocated_addr = block_start + slot_offset;
+        SHM_LOG_DEBUG("Reusing free slot at offset " << slot_offset
+                      << " (slot=" << slot_size << " req=" << size << ")");
+    } else {
+        // 没有合适的槽位，从 bump 区域分配
+        if (block->size - block->high_water < size) {
+            // 防御：不应该发生（调用前已通过 find_suitable_block 检查）
+            SHM_LOG_ERROR("allocate_from_block: bump area exhausted unexpectedly");
+            return nullptr;
+        }
+        allocated_addr = block_start + block->high_water;
+        block->high_water += size;
+    }
+
     block->used_size += size;
     address_to_block_map_[allocated_addr] = block;
     // 记录分配信息：<数据大小, 总大小（无padding时等于数据大小）>
     external_alloc_info_map_[allocated_addr] = {size, size};
     update_block_statistics(block, size);
-    
+
     return allocated_addr;
 }
 
