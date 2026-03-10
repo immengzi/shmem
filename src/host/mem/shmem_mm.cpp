@@ -86,15 +86,16 @@ void *aclshmem_malloc(size_t size)
         void *ptr = dynamic_memory_manager_instance->allocate(size);
         SHM_LOG_DEBUG("aclshmem_malloc(" << size << ")" << " ptr: " << ptr << " (dynamic)");
         
+        int32_t ret = 0;
         if (ptr != nullptr) {
-            auto ret = aclshmemi_control_barrier_all();
+            ret = aclshmemi_control_barrier_all();
             if (ret != 0) {
                 SHM_LOG_ERROR("malloc mem barrier failed, ret: " << ret);
                 dynamic_memory_manager_instance->release(ptr);
                 return nullptr;
             }
         }
-        
+
 #ifdef DEBUG_MODE
         ret = is_alloc_size_symmetric(size);
         if (ret != 0) {
