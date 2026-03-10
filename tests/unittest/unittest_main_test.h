@@ -20,6 +20,7 @@ int32_t test_set_attr(int32_t my_pe, int32_t n_pes, uint64_t local_mem_size, con
                        aclshmemx_init_attr_t *attributes);
 void test_init(int rank_id, int n_ranks, uint64_t local_mem_size, aclrtStream *st);
 void test_finalize(aclrtStream stream, int device_id);
+void test_single_task(std::function<void(int, int, uint64_t)> func, uint64_t local_mem_size);
 void test_mutil_task(std::function<void(int, int, uint64_t)> func, uint64_t local_mem_size, int process_count);
 
 #endif // UNITTEST_H

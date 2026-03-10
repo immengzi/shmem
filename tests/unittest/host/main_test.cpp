@@ -72,13 +72,17 @@ void test_init(int rank_id, int n_ranks, uint64_t local_mem_size, aclrtStream *s
     EXPECT_EQ(status = aclshmemx_set_conf_store_tls(false, nullptr, 0), 0);
 
     aclshmemx_init_attr_t attributes;
-    
-    test_set_attr(rank_id, n_ranks, local_mem_size, test_global_ipport, &attributes);
 
-
-    status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
-
-    EXPECT_EQ(status, 0);
+    if (n_ranks == 1) {
+        aclshmemx_uniqueid_t uid;
+        EXPECT_EQ(aclshmemx_get_uniqueid(&uid), 0);
+        EXPECT_EQ(aclshmemx_set_attr_uniqueid_args(0, 1, local_mem_size, &uid, &attributes), 0);
+        EXPECT_EQ(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes), 0);
+    } else {
+        test_set_attr(rank_id, n_ranks, local_mem_size, test_global_ipport, &attributes);
+        status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
+        EXPECT_EQ(status, 0);
+    }
     *st = stream;
 }
 
@@ -144,6 +148,11 @@ void test_finalize(aclrtStream stream, int device_id)
     EXPECT_EQ(aclrtDestroyStream(stream), 0);
     EXPECT_EQ(aclrtResetDevice(device_id), 0);
     EXPECT_EQ(aclFinalize(), 0);
+}
+
+void test_single_task(std::function<void(int, int, uint64_t)> func, uint64_t local_mem_size)
+{
+    func(test_first_rank, 1, local_mem_size);
 }
 
 void test_mutil_task(std::function<void(int, int, uint64_t)> func, uint64_t local_mem_size, int process_count)

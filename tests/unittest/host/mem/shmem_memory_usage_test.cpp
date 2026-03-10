@@ -169,9 +169,7 @@ protected:
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, baseline_and_init_overhead)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: baseline_and_init_overhead");
@@ -204,7 +202,7 @@ TEST_F(MemoryUsageTest, baseline_and_init_overhead)
 
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,9 +210,7 @@ TEST_F(MemoryUsageTest, baseline_and_init_overhead)
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, single_alloc_and_free)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: single_alloc_and_free");
@@ -259,7 +255,7 @@ TEST_F(MemoryUsageTest, single_alloc_and_free)
             test_finalize(stream, device_id);
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -267,9 +263,7 @@ TEST_F(MemoryUsageTest, single_alloc_and_free)
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, multi_size_alloc_overhead)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: multi_size_alloc_overhead");
@@ -312,7 +306,7 @@ TEST_F(MemoryUsageTest, multi_size_alloc_overhead)
             test_finalize(stream, device_id);
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,9 +314,7 @@ TEST_F(MemoryUsageTest, multi_size_alloc_overhead)
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, align_overhead)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: align_overhead");
@@ -378,7 +370,7 @@ TEST_F(MemoryUsageTest, align_overhead)
             test_finalize(stream, device_id);
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,9 +378,7 @@ TEST_F(MemoryUsageTest, align_overhead)
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, fragmentation_after_interleaved_free)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: fragmentation_after_interleaved_free");
@@ -431,7 +421,7 @@ TEST_F(MemoryUsageTest, fragmentation_after_interleaved_free)
             test_finalize(stream, device_id);
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -515,9 +505,7 @@ TEST_F(MemoryUsageTest, framework_fixed_overhead_report)
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, calloc_zeroing_overhead)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: calloc_zeroing_overhead");
@@ -566,7 +554,7 @@ TEST_F(MemoryUsageTest, calloc_zeroing_overhead)
             test_finalize(stream, device_id);
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -574,9 +562,7 @@ TEST_F(MemoryUsageTest, calloc_zeroing_overhead)
 // ---------------------------------------------------------------------------
 TEST_F(MemoryUsageTest, stress_alloc_memory_trend)
 {
-    const int process_count = test_gnpu_num;
-
-    test_mutil_task(
+    test_single_task(
         [](int rank_id, int n_ranks, uint64_t local_mem_size) {
             int32_t device_id = rank_id % test_gnpu_num + test_first_npu;
             print_separator("Test: stress_alloc_memory_trend");
@@ -631,5 +617,5 @@ TEST_F(MemoryUsageTest, stress_alloc_memory_trend)
             test_finalize(stream, device_id);
             print_separator();
         },
-        kLocalMemSize, process_count);
+        kLocalMemSize);
 }
