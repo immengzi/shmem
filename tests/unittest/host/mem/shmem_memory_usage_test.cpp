@@ -55,7 +55,7 @@
 
 #include "shmem.h"
 #include "shmemi_host_common.h"
-#include "shmemi_mm.h"                     // aclshmem_get_memory_stats()
+#include "mem/shmemi_mm.h"                 // aclshmem_get_memory_stats()
 #include "host_device/shmem_common_types.h"
 #include "unittest_main_test.h"
 
