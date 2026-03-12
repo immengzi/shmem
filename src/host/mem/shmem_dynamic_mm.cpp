@@ -15,7 +15,7 @@
 
 // 内存扩容策略常量
 constexpr uint64_t MIN_EXPANSION_SIZE = 512 * 1024 * 1024;  // 512MB最小扩容（减少扩容次数）
-constexpr double EXPANSION_FACTOR = 1.5;                    // 1.5倍扩容因子
+constexpr double EXPANSION_FACTOR = 1.0;                    // 1.0倍扩容因子（精确按需，不过度预留）
 constexpr uint64_t MAX_BLOCK_SIZE = 8ULL * 1024 * 1024 * 1024;  // 8GB最大单块
 // 设备内存预留：expand_pool 保留给驱动/CANN 内部使用的最小余量
 constexpr uint64_t DEVICE_MEM_HEADROOM = 512 * 1024 * 1024;  // 512MB保留
@@ -202,10 +202,14 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
             if (it->second >= total_size) {
                 uint64_t remaining = it->second - total_size;
                 uint64_t slot_offset = it->first;
-                it = slots.erase(it);
+                // 就地更新或擦除，避免 map 节点分配开销
                 if (remaining > 0) {
-                    slots[slot_offset + total_size] = remaining;
+                    it->first  = slot_offset + total_size;
+                    it->second = remaining;
+                } else {
+                    it = slots.erase(it);
                 }
+                (void)it;  // suppress unused-variable warning after erase path
                 address_to_block_map_[aligned_start] = block.get();
                 external_alloc_info_map_[aligned_start] = {aligned_size, total_size};
                 block->used_size += aligned_size;
@@ -277,38 +281,40 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
             block->used_size = 0;  // 防止下溢
         }
 
-        // 将归还的区域插入有序空闲槽位 map，O(log n) 插入并与相邻槽合并，减少碎片
-        // high_water 保持不变，只有 bump 区域全空时才回退
+        // 将归还区域按 offset 有序插入 vector（lower_bound + insert），然后就地合并相邻槽。
+        // 使用 vector 而非 map：N 通常 < 10，vector 无堆分配、缓存友好，
+        // 推理热路径（每层 Q/K/V 分配释放）中比 map 快一个量级。
+        // high_water 保持不变，只有 bump 区域全空时才回退。
         uint64_t freed_offset = static_cast<uint64_t>(
             static_cast<uint8_t*>(address) -
             static_cast<uint8_t*>(block->base_addr));
 
         auto& slots = block->free_slots;
-        uint64_t merged_offset = freed_offset;
-        uint64_t merged_size   = total_size;
+        // O(log n) 定位插入位置
+        auto pos = std::lower_bound(slots.begin(), slots.end(),
+                                    std::make_pair(freed_offset, uint64_t(0)));
+        // O(n) 原地插入（n 极小，无堆分配，比 map::insert 快）
+        pos = slots.insert(pos, {freed_offset, total_size});
 
-        // 向后合并：freed 末尾紧接下一块起始
-        auto next_it = slots.lower_bound(freed_offset);
-        if (next_it != slots.end() &&
-            merged_offset + merged_size == next_it->first) {
-            merged_size += next_it->second;
-            next_it = slots.erase(next_it);
+        // 向后合并：pos 末尾紧接 next 起始
+        auto next = pos + 1;
+        if (next != slots.end() && pos->first + pos->second == next->first) {
+            pos->second += next->second;
+            slots.erase(next);
         }
-        // 向前合并：上一块末尾紧接 freed 起始
-        if (next_it != slots.begin()) {
-            auto prev_it = std::prev(next_it);
-            if (prev_it->first + prev_it->second == merged_offset) {
-                merged_offset = prev_it->first;
-                merged_size  += prev_it->second;
-                slots.erase(prev_it);
+        // 向前合并：prev 末尾紧接 pos 起始
+        if (pos != slots.begin()) {
+            auto prev = pos - 1;
+            if (prev->first + prev->second == pos->first) {
+                prev->second += pos->second;
+                slots.erase(pos);
+                pos = prev;
             }
         }
-        // 若合并后的空闲区紧贴 high_water，将 high_water 回退以释放 bump 空间
-        if (merged_offset + merged_size == block->high_water) {
-            block->high_water = merged_offset;
-            // 不写入 slots，因为该区间已归还给 bump 区
-        } else {
-            slots[merged_offset] = merged_size;
+        // 若合并后紧贴 high_water，回退 high_water 并移除该槽
+        if (pos->first + pos->second == block->high_water) {
+            block->high_water = pos->first;
+            slots.erase(pos);
         }
 
         update_block_statistics(block, -static_cast<int64_t>(data_size));
@@ -540,7 +546,7 @@ dynamic_memory_block* dynamic_memory_manager::find_suitable_block(uint64_t size)
     // 优先从空闲槽位中寻找合适的外部块（best-fit 复用已归还的段）
     for (auto& block : memory_blocks_) {
         if (!block->is_external) continue;
-        // 检查空闲槽位（map 按 offset 有序，遍历 value 即大小）
+        // 检查空闲槽位（vector 按 offset 有序，遍历 .second 即大小）
         for (const auto& kv : block->free_slots) {
             if (kv.second >= size) {
                 return block.get();
@@ -576,10 +582,13 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     if (best_it != block->free_slots.end()) {
         uint64_t slot_offset = best_it->first;
         uint64_t slot_size   = best_it->second;
-        block->free_slots.erase(best_it);
-        // 如果槽比请求大，将剩余部分放回空闲 map
+        // 如果槽比请求大，就地更新该元素（避免 erase+insert 的移位开销）；
+        // 否则直接擦除。vector 的原地更新比 map 的节点 new/delete 快得多。
         if (slot_size > size) {
-            block->free_slots[slot_offset + size] = slot_size - size;
+            best_it->first  = slot_offset + size;
+            best_it->second = slot_size - size;
+        } else {
+            block->free_slots.erase(best_it);
         }
         allocated_addr = block_start + slot_offset;
         SHM_LOG_DEBUG("Reusing free slot at offset " << slot_offset
