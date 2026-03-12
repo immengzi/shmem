@@ -76,13 +76,16 @@ private:
     uint8_t *const initial_base_;
     const uint64_t initial_size_;
     
-    // 动态内存块管理
+    // 动态内存块分配记录：将 block 指针与大小信息合并在一张 map 中，
+    // 避免原来 address_to_block_map_ + external_alloc_info_map_ 的双重查找开销。
+    // 每次动态块 alloc/free 只需一次 O(log N) 查找（原来是两次）。
+    struct DynAllocInfo {
+        dynamic_memory_block* block;
+        uint64_t data_size;   // 实际分配的数据大小
+        uint64_t total_size;  // 含对齐 padding 的总大小（用于 free_slots 归还）
+    };
     std::vector<std::unique_ptr<dynamic_memory_block>> memory_blocks_;
-    std::map<void*, dynamic_memory_block*> address_to_block_map_;
-    
-    // 外部内存块分配大小映射（用于准确统计和释放）
-    // key: 分配的指针, value: pair<实际分配大小, 包含padding的总大小>
-    std::map<void*, std::pair<uint64_t, uint64_t>> external_alloc_info_map_;
+    std::map<void*, DynAllocInfo> address_to_block_map_;
     
     // 统计信息
     uint64_t total_allocated_;
