@@ -14,8 +14,23 @@
 #include "shmem_dynamic_mm.h"
 
 // 内存扩容策略常量
-constexpr uint64_t MIN_EXPANSION_SIZE = 256 * 1024 * 1024;  // 256MB最小扩容
-constexpr double EXPANSION_FACTOR = 1.5;                    // 1.5倍扩容因子
+//
+// MIN_EXPANSION_SIZE：单次扩容的最小块大小。
+//   256 MB 对频繁的小分配而言块太细碎，512 MB 是合理的下限：
+//   既能覆盖多个后续小分配（减少 aclrtMalloc 次数），
+//   又不会在初始池（~40 GiB）已经覆盖大部分需求后过度浪费剩余显存。
+constexpr uint64_t MIN_EXPANSION_SIZE = 512ULL * 1024 * 1024;  // 512MB最小扩容
+
+// EXPANSION_FACTOR：扩容因子（基于 required_size 的倍数）。
+//   初始池已由 aclrtGetMemInfo 自动定为设备总量的 80%（最多 40 GiB），
+//   动态扩容只处理剩余的溢出部分，不再需要激进的预分配；
+//   同时 expand_pool 内已有基于空闲内存的收缩逻辑兜底，1.0 足够安全。
+constexpr double EXPANSION_FACTOR = 1.0;                       // 1倍扩容因子
+
+// MAX_BLOCK_SIZE：单次扩容块的上限。
+//   保持 4 GiB 确保超大单张量（如大 KV Cache 块）可以一次扩容成功；
+//   expand_pool 的 aclrtGetMemInfo 裁剪逻辑会将实际请求限制在可用空闲内存以内，
+//   因此此上限不会导致超额分配。
 constexpr uint64_t MAX_BLOCK_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB最大单块
 
 dynamic_memory_manager::dynamic_memory_manager(void *base, uint64_t initial_size) noexcept 
