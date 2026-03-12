@@ -370,24 +370,54 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     // 注意：此函数假设调用者已持有 spinlock_
     // 先解锁，避免长时间持有锁进行内存分配
     pthread_spin_unlock(&spinlock_);
-    
+
     // 计算需要的扩容大小
     uint64_t expansion_size = std::max(required_size, MIN_EXPANSION_SIZE);
     expansion_size = static_cast<uint64_t>(expansion_size * EXPANSION_FACTOR);
     expansion_size = std::min(expansion_size, MAX_BLOCK_SIZE);
-    
+
     // 确保对齐
     constexpr uint64_t ALIGNMENT = 256 * 1024; // 256KB对齐
     expansion_size = (expansion_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    
+
+    // 用设备空闲内存做上界：避免在 gpu_memory_utilization 高时请求的块超过剩余可用内存
+    // 从而导致 aclrtMalloc 失败，即使 required_size 本身可以满足。
+    size_t free_bytes = 0, total_bytes = 0;
+    if (aclrtGetMemInfo(ACL_HBM_MEM, &free_bytes, &total_bytes) == ACL_SUCCESS && free_bytes > 0) {
+        // 保留 256MB 安全余量，防止系统内存碎片导致分配失败
+        constexpr uint64_t SAFETY_MARGIN = 256ULL * 1024 * 1024;
+        uint64_t usable = (free_bytes > SAFETY_MARGIN) ? (free_bytes - SAFETY_MARGIN) : 0;
+        if (expansion_size > usable) {
+            // 将扩容大小向下收缩到可用内存，同时不低于 required_size
+            uint64_t clamped = std::max(required_size, usable);
+            clamped = (clamped + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+            SHM_LOG_INFO("Clamping expansion size from " << expansion_size
+                          << " to " << clamped
+                          << " bytes (free=" << free_bytes << ")");
+            expansion_size = clamped;
+        }
+    }
+
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
-    
+
     // 使用CANN接口分配新的内存块（此时不持有锁，允许其他线程并行）
     void* new_block_addr = nullptr;
     aclError ret = aclrtMalloc(&new_block_addr, expansion_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    
+
+    // 若首次分配失败且扩容大小大于实际需求，则回退到最小所需大小重试
+    // 这解决了 gpu_memory_utilization 较高时剩余内存刚好不足 expansion_size
+    // 但足以满足 required_size 的情况。
+    if ((ret != ACL_SUCCESS || new_block_addr == nullptr) && expansion_size > required_size) {
+        uint64_t min_size = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+        SHM_LOG_INFO("First expansion attempt failed (size=" << expansion_size
+                      << "); retrying with minimum required size=" << min_size);
+        new_block_addr = nullptr;
+        expansion_size = min_size;
+        ret = aclrtMalloc(&new_block_addr, expansion_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    }
+
     if (ret != ACL_SUCCESS || new_block_addr == nullptr) {
-        SHM_LOG_ERROR("Failed to allocate external memory block of size " << expansion_size 
+        SHM_LOG_ERROR("Failed to allocate external memory block of size " << expansion_size
                       << ", error code: " << ret);
         // 重新加锁，保持锁状态一致性
         pthread_spin_lock(&spinlock_);
