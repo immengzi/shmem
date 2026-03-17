@@ -87,11 +87,14 @@ void *aclshmem_malloc(size_t size)
         SHM_LOG_DEBUG("aclshmem_malloc(" << size << ")" << " ptr: " << ptr << " (dynamic)");
         
         if (ptr != nullptr) {
-            auto ret = aclshmemi_control_barrier_all();
-            if (ret != 0) {
-                SHM_LOG_ERROR("malloc mem barrier failed, ret: " << ret);
-                dynamic_memory_manager_instance->release(ptr);
-                return nullptr;
+            // 单卡（npes==1）时 barrier 是空操作，跳过调用链以节省开销
+            if (g_state.npes > 1) {
+                auto ret = aclshmemi_control_barrier_all();
+                if (ret != 0) {
+                    SHM_LOG_ERROR("malloc mem barrier failed, ret: " << ret);
+                    dynamic_memory_manager_instance->release(ptr);
+                    return nullptr;
+                }
             }
         }
         
@@ -116,12 +119,14 @@ void *aclshmem_malloc(size_t size)
 
     void *ptr = aclshmemi_memory_manager->allocate(size);
     SHM_LOG_DEBUG("aclshmem_malloc(" << size << ")" << " ptr: " << ptr << " (static)");
-    auto ret = aclshmemi_control_barrier_all();
-    if (ret != 0) {
-        SHM_LOG_ERROR("malloc mem barrier failed, ret: " << ret);
-        if (ptr != nullptr) {
-            aclshmemi_memory_manager->release(ptr);
-            ptr = nullptr;
+    if (g_state.npes > 1) {
+        auto ret = aclshmemi_control_barrier_all();
+        if (ret != 0) {
+            SHM_LOG_ERROR("malloc mem barrier failed, ret: " << ret);
+            if (ptr != nullptr) {
+                aclshmemi_memory_manager->release(ptr);
+                ptr = nullptr;
+            }
         }
     }
 #ifdef DEBUG_MODE
@@ -151,13 +156,15 @@ void *aclshmem_calloc(size_t nmemb, size_t size)
             }
         }
 
-        auto ret = aclshmemi_control_barrier_all();
-        if (ret != 0) {
-            SHM_LOG_ERROR("calloc mem barrier failed, ret: " << ret);
-            if (ptr != nullptr) {
-                dynamic_memory_manager_instance->release(ptr);
+        if (g_state.npes > 1) {
+            auto ret = aclshmemi_control_barrier_all();
+            if (ret != 0) {
+                SHM_LOG_ERROR("calloc mem barrier failed, ret: " << ret);
+                if (ptr != nullptr) {
+                    dynamic_memory_manager_instance->release(ptr);
+                }
+                return nullptr;
             }
-            return nullptr;
         }
 
         SHM_LOG_DEBUG("aclshmem_calloc(" << nmemb << ", " << size << ") (dynamic)");
@@ -182,12 +189,14 @@ void *aclshmem_calloc(size_t nmemb, size_t size)
         }
     }
 
-    auto ret = aclshmemi_control_barrier_all();
-    if (ret != 0) {
-        SHM_LOG_ERROR("calloc mem barrier failed, ret: " << ret);
-        if (ptr != nullptr) {
-            aclshmemi_memory_manager->release(ptr);
-            ptr = nullptr;
+    if (g_state.npes > 1) {
+        auto ret = aclshmemi_control_barrier_all();
+        if (ret != 0) {
+            SHM_LOG_ERROR("calloc mem barrier failed, ret: " << ret);
+            if (ptr != nullptr) {
+                aclshmemi_memory_manager->release(ptr);
+                ptr = nullptr;
+            }
         }
     }
 
@@ -200,13 +209,13 @@ void *aclshmem_align(size_t alignment, size_t size)
     // 优先使用动态内存管理器
     if (enable_dynamic_expansion && dynamic_memory_manager_instance) {
         auto ptr = dynamic_memory_manager_instance->aligned_allocate(alignment, size);
-        auto ret = aclshmemi_control_barrier_all();
-        if (ret != 0) {
-            SHM_LOG_ERROR("aclshmem_align barrier failed, ret: " << ret);
-            if (ptr != nullptr) {
+        if (ptr != nullptr && g_state.npes > 1) {
+            auto ret = aclshmemi_control_barrier_all();
+            if (ret != 0) {
+                SHM_LOG_ERROR("aclshmem_align barrier failed, ret: " << ret);
                 dynamic_memory_manager_instance->release(ptr);
+                return nullptr;
             }
-            return nullptr;
         }
         SHM_LOG_DEBUG("aclshmem_align(" << alignment << ", " << size << ") (dynamic)");
         return ptr;
@@ -219,10 +228,10 @@ void *aclshmem_align(size_t alignment, size_t size)
     }
 
     auto ptr = aclshmemi_memory_manager->aligned_allocate(alignment, size);
-    auto ret = aclshmemi_control_barrier_all();
-    if (ret != 0) {
-        SHM_LOG_ERROR("aclshmem_align barrier failed, ret: " << ret);
-        if (ptr != nullptr) {
+    if (ptr != nullptr && g_state.npes > 1) {
+        auto ret = aclshmemi_control_barrier_all();
+        if (ret != 0) {
+            SHM_LOG_ERROR("aclshmem_align barrier failed, ret: " << ret);
             aclshmemi_memory_manager->release(ptr);
             ptr = nullptr;
         }

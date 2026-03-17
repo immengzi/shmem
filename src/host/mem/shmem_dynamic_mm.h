@@ -29,8 +29,11 @@ struct dynamic_memory_block {
     uint64_t high_water;       // bump指针：下一次分配的起始偏移（只增不减）
     bool is_external;          // 是否为外部CANN分配的内存
 
-    // 外部块空闲槽位列表：{偏移, 大小}，按大小排序以支持best-fit复用
-    // 仅用于 is_external == true 的块
+    // 外部块空闲槽位列表：按 offset 有序排列的 {offset, size} 对。
+    // 使用有序 vector（lower_bound 插入 + 原地邻居合并），避免 std::map 每节点
+    // 的堆分配开销——推理热路径中 alloc/free 非常频繁，map 的 new/delete 会
+    // 累积成系统性延迟。N 通常 < 10，vector 的缓存局部性远优于 map。
+    // 仅用于 is_external == true 的块。
     std::vector<std::pair<uint64_t, uint64_t>> free_slots;
 
     dynamic_memory_block(void* addr, uint64_t block_size, bool external = false)

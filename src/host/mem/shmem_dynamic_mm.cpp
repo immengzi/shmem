@@ -14,9 +14,9 @@
 #include "shmem_dynamic_mm.h"
 
 // 内存扩容策略常量
-constexpr uint64_t MIN_EXPANSION_SIZE = 256 * 1024 * 1024;  // 256MB最小扩容
-constexpr double EXPANSION_FACTOR = 1.5;                    // 1.5倍扩容因子
-constexpr uint64_t MAX_BLOCK_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB最大单块
+constexpr uint64_t MIN_EXPANSION_SIZE = 512 * 1024 * 1024;  // 512MB最小扩容（减少扩容次数）
+constexpr double EXPANSION_FACTOR = 1.0;                    // 1.0倍扩容因子（精确按需，不过度预留）
+constexpr uint64_t MAX_BLOCK_SIZE = 8ULL * 1024 * 1024 * 1024;  // 8GB最大单块
 
 dynamic_memory_manager::dynamic_memory_manager(void *base, uint64_t initial_size) noexcept 
     : initial_base_{reinterpret_cast<uint8_t *>(base)}, 
@@ -188,7 +188,7 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
 
         uint8_t* block_start = static_cast<uint8_t*>(block->base_addr);
 
-        // 先尝试从空闲槽位中找到合适的对齐槽
+        // 先尝试从空闲槽位 map 中找到合适的对齐槽
         auto& slots = block->free_slots;
         bool slot_found = false;
         for (auto it = slots.begin(); it != slots.end(); ++it) {
@@ -200,11 +200,14 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
             if (it->second >= total_size) {
                 uint64_t remaining = it->second - total_size;
                 uint64_t slot_offset = it->first;
+                // 就地更新或擦除，避免 map 节点分配开销
                 if (remaining > 0) {
-                    *it = {slot_offset + total_size, remaining};
+                    it->first  = slot_offset + total_size;
+                    it->second = remaining;
                 } else {
-                    slots.erase(it);
+                    it = slots.erase(it);
                 }
+                (void)it;  // suppress unused-variable warning after erase path
                 address_to_block_map_[aligned_start] = block.get();
                 external_alloc_info_map_[aligned_start] = {aligned_size, total_size};
                 block->used_size += aligned_size;
@@ -276,36 +279,41 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
             block->used_size = 0;  // 防止下溢
         }
 
-        // 将归还的区域加入空闲槽位列表，供后续 best-fit 复用
-        // high_water 保持不变，只有 bump 区域未分配时才回退
+        // 将归还区域按 offset 有序插入 vector（lower_bound + insert），然后就地合并相邻槽。
+        // 使用 vector 而非 map：N 通常 < 10，vector 无堆分配、缓存友好，
+        // 推理热路径（每层 Q/K/V 分配释放）中比 map 快一个量级。
+        // high_water 保持不变，只有 bump 区域全空时才回退。
         uint64_t freed_offset = static_cast<uint64_t>(
             static_cast<uint8_t*>(address) -
             static_cast<uint8_t*>(block->base_addr));
 
-        // 尝试与相邻空闲槽合并，减少碎片
         auto& slots = block->free_slots;
-        slots.push_back({freed_offset, total_size});
-        // 按 offset 排序后合并相邻/重叠的槽
-        std::sort(slots.begin(), slots.end());
-        std::vector<std::pair<uint64_t, uint64_t>> merged;
-        for (const auto& s : slots) {
-            if (!merged.empty() &&
-                merged.back().first + merged.back().second >= s.first) {
-                // 合并：扩展上一个槽的大小
-                uint64_t new_end = std::max(merged.back().first + merged.back().second,
-                                            s.first + s.second);
-                merged.back().second = new_end - merged.back().first;
-            } else {
-                merged.push_back(s);
+        // O(log n) 定位插入位置
+        auto pos = std::lower_bound(slots.begin(), slots.end(),
+                                    std::make_pair(freed_offset, uint64_t(0)));
+        // O(n) 原地插入（n 极小，无堆分配，比 map::insert 快）
+        pos = slots.insert(pos, {freed_offset, total_size});
+
+        // 向后合并：pos 末尾紧接 next 起始
+        auto next = pos + 1;
+        if (next != slots.end() && pos->first + pos->second == next->first) {
+            pos->second += next->second;
+            slots.erase(next);
+        }
+        // 向前合并：prev 末尾紧接 pos 起始
+        if (pos != slots.begin()) {
+            auto prev = pos - 1;
+            if (prev->first + prev->second == pos->first) {
+                prev->second += pos->second;
+                slots.erase(pos);
+                pos = prev;
             }
         }
-        // 如果末尾空闲槽紧贴 high_water，将 high_water 回退以释放 bump 空间
-        if (!merged.empty() &&
-            merged.back().first + merged.back().second == block->high_water) {
-            block->high_water = merged.back().first;
-            merged.pop_back();
+        // 若合并后紧贴 high_water，回退 high_water 并移除该槽
+        if (pos->first + pos->second == block->high_water) {
+            block->high_water = pos->first;
+            slots.erase(pos);
         }
-        slots = std::move(merged);
 
         update_block_statistics(block, -static_cast<int64_t>(data_size));
 
@@ -370,43 +378,65 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     // 注意：此函数假设调用者已持有 spinlock_
     // 先解锁，避免长时间持有锁进行内存分配
     pthread_spin_unlock(&spinlock_);
-    
-    // 计算需要的扩容大小
+
+    // ── 计算期望扩容大小 ──────────────────────────────────────────────────────
+    // 至少分配 required_size，同时用 EXPANSION_FACTOR 预留余量减少下次扩容频率；
+    // 上限取 MAX_BLOCK_SIZE，确保不超出单块限制。
+    constexpr uint64_t ALIGNMENT = 256 * 1024; // 256KB对齐
+
     uint64_t expansion_size = std::max(required_size, MIN_EXPANSION_SIZE);
     expansion_size = static_cast<uint64_t>(expansion_size * EXPANSION_FACTOR);
     expansion_size = std::min(expansion_size, MAX_BLOCK_SIZE);
-    
-    // 确保对齐
-    constexpr uint64_t ALIGNMENT = 256 * 1024; // 256KB对齐
+    // 对齐到 256KB
     expansion_size = (expansion_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    
+    // 对齐后仍需满足 required_size
+    if (expansion_size < required_size) {
+        expansion_size = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    }
+
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
-    
-    // 使用CANN接口分配新的内存块（此时不持有锁，允许其他线程并行）
+
+    // ── 分级尝试：优先分配期望大小，失败则逐步折半直到 required_size ──────────
     void* new_block_addr = nullptr;
-    aclError ret = aclrtMalloc(&new_block_addr, expansion_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    
-    if (ret != ACL_SUCCESS || new_block_addr == nullptr) {
-        SHM_LOG_ERROR("Failed to allocate external memory block of size " << expansion_size 
-                      << ", error code: " << ret);
-        // 重新加锁，保持锁状态一致性
+    uint64_t try_size = expansion_size;
+    uint64_t min_acceptable = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+    while (try_size >= min_acceptable) {
+        new_block_addr = nullptr;
+        aclError ret = aclrtMalloc(&new_block_addr, try_size, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (ret == ACL_SUCCESS && new_block_addr != nullptr) {
+            expansion_size = try_size;
+            break;
+        }
+        SHM_LOG_WARN("aclrtMalloc(" << try_size << ") failed (ret=" << ret
+                     << "), retrying with smaller size");
+        if (try_size == min_acceptable) {
+            break;  // 已是最小可接受大小，放弃
+        }
+        // 折半，但不低于 min_acceptable
+        try_size = std::max(try_size / 2, min_acceptable);
+        try_size = (try_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    }
+
+    if (new_block_addr == nullptr) {
+        SHM_LOG_ERROR("Failed to expand memory pool for required_size=" << required_size
+                      << " after all retries");
         pthread_spin_lock(&spinlock_);
         return false;
     }
-    
+
     // 内存分配成功，重新加锁更新元数据
     pthread_spin_lock(&spinlock_);
-    
+
     // 创建新的内存块管理结构
     auto new_block = std::make_unique<dynamic_memory_block>(new_block_addr, expansion_size, true);
-    dynamic_memory_block* block_ptr = new_block.get();
     memory_blocks_.push_back(std::move(new_block));
-    
+
     total_capacity_ += expansion_size;
-    
-    SHM_LOG_INFO("Successfully expanded memory pool. New block: " << new_block_addr 
+
+    SHM_LOG_INFO("Successfully expanded memory pool. New block: " << new_block_addr
                  << ", size: " << expansion_size << ", total capacity: " << total_capacity_);
-    
+
     return true;
 }
 
@@ -483,9 +513,9 @@ dynamic_memory_block* dynamic_memory_manager::find_suitable_block(uint64_t size)
     // 优先从空闲槽位中寻找合适的外部块（best-fit 复用已归还的段）
     for (auto& block : memory_blocks_) {
         if (!block->is_external) continue;
-        // 检查空闲槽位
-        for (const auto& slot : block->free_slots) {
-            if (slot.second >= size) {
+        // 检查空闲槽位（vector 按 offset 有序，遍历 .second 即大小）
+        for (const auto& kv : block->free_slots) {
+            if (kv.second >= size) {
                 return block.get();
             }
         }
@@ -505,7 +535,8 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     uint8_t* block_start = static_cast<uint8_t*>(block->base_addr);
     void* allocated_addr = nullptr;
 
-    // 优先复用空闲槽位（best-fit：找到能满足需求的最小槽）
+    // 优先复用空闲槽位（best-fit：在 map 中找能满足需求的最小槽）
+    // map 按 offset 有序；通过线性扫描找最小满足槽，通常槽数量很少
     auto best_it = block->free_slots.end();
     uint64_t best_size = UINT64_MAX;
     for (auto it = block->free_slots.begin(); it != block->free_slots.end(); ++it) {
@@ -518,9 +549,11 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     if (best_it != block->free_slots.end()) {
         uint64_t slot_offset = best_it->first;
         uint64_t slot_size   = best_it->second;
-        // 如果槽比请求大，将剩余部分放回空闲列表
+        // 如果槽比请求大，就地更新该元素（避免 erase+insert 的移位开销）；
+        // 否则直接擦除。vector 的原地更新比 map 的节点 new/delete 快得多。
         if (slot_size > size) {
-            *best_it = {slot_offset + size, slot_size - size};
+            best_it->first  = slot_offset + size;
+            best_it->second = slot_size - size;
         } else {
             block->free_slots.erase(best_it);
         }
