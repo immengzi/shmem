@@ -360,10 +360,17 @@ class DynamicMemoryTester:
     def _print_memory_stats(self, prefix=""):
         total, used, avail = self._get_memory_stats()
         mb = 1024 * 1024
+        
+        # 转换为MB并保留三位小数，不四舍五入
+        def to_mb(bytes_val):
+            mb_val = bytes_val / mb
+            # 不四舍五入，截断到三位小数
+            return int(mb_val * 1000) / 1000.0
+        
         print(f"{prefix}Memory Stats - "
-              f"Total: {total / mb:.2f}MB, "
-              f"Used: {used / mb:.2f}MB, "
-              f"Available: {avail / mb:.2f}MB")
+              f"Total: {to_mb(total):.3f}MB, "
+              f"Used: {to_mb(used):.3f}MB, "
+              f"Available: {to_mb(avail):.3f}MB")
 
     # 测试用例
 
@@ -557,6 +564,197 @@ class DynamicMemoryTester:
 
         return passed
 
+    def test_incremental_release(self):
+        """
+        测试逐个释放内存的场景，验证内存释放的正确性。
+
+        Returns:
+            bool: 所有操作成功返回 True，否则返回 False。
+        """
+        sizes_mb = [8, 12, 16, 20]
+        print(f"\n=== Testing Incremental Release ===")
+        self._print_memory_stats("Before allocation: ")
+
+        allocated_ptrs = []
+
+        try:
+            # 分配多个内存块
+            for i, size_mb in enumerate(sizes_mb):
+                size_bytes = int(size_mb * 1024 * 1024)
+                print(f"\nAllocating {size_mb} MB (block #{i + 1})...")
+
+                ptr = self._lib.aclshmem_malloc(size_bytes)
+                if ptr:
+                    allocated_ptrs.append(ptr)
+                    print(f"✓ Success! Pointer: {hex(ptr)}")
+                else:
+                    print(f"✗ Failed to allocate {size_mb} MB")
+                    # 释放已分配的内存
+                    for p in allocated_ptrs:
+                        self._lib.aclshmem_free(p)
+                    allocated_ptrs.clear()
+                    return False
+
+            self._print_memory_stats("After all allocations: ")
+
+            # 逐个释放内存块，并在每次释放后打印内存统计
+            for i, ptr in enumerate(allocated_ptrs):
+                print(f"\nReleasing block #{i + 1} (pointer: {hex(ptr)})...")
+                self._lib.aclshmem_free(ptr)
+                print(f"✓ Block #{i + 1} released successfully")
+                self._print_memory_stats("After release: ")
+
+            self._print_memory_stats("After all releases: ")
+            return True
+
+        except Exception as e:
+            print(f"✗ Exception occurred: {e}")
+            # 清理已分配的内存
+            for p in allocated_ptrs:
+                self._lib.aclshmem_free(p)
+            allocated_ptrs.clear()
+            return False
+
+    def test_small_granularity_memory(self):
+        """
+        测试小粒度内存操作，包括连续申请和申请释放交替的场景，观察内存碎片情况。
+
+        Returns:
+            bool: 所有操作成功返回 True，否则返回 False。
+        """
+        print("\n=== Testing Small Granularity Memory Operations ===")
+        self._print_memory_stats("Initial state: ")
+
+        # Test 1: 连续申请小粒度内存
+        print("\n--- Test 1: Continuous Small Allocations ---")
+        small_ptrs = []
+        num_small_allocs = 100
+        small_sizes = [4096, 65536]  # 4K, 64K
+
+        try:
+            for size in small_sizes:
+                print(f"\nAllocating {num_small_allocs} blocks of {size // 1024}K each...")
+                
+                for i in range(num_small_allocs):
+                    ptr = self._lib.aclshmem_malloc(size)
+                    if ptr:
+                        small_ptrs.append(ptr)
+                    else:
+                        print(f"✗ Failed to allocate {size // 1024}K block #{i + 1}")
+                        # 释放已分配的内存
+                        for p in small_ptrs:
+                            self._lib.aclshmem_free(p)
+                        small_ptrs.clear()
+                        return False
+                
+                print(f"✓ All {num_small_allocs} blocks of {size // 1024}K allocated successfully")
+                self._print_memory_stats("After allocation: ")
+
+            # 释放所有小粒度内存
+            print("\nReleasing all small blocks...")
+            for p in small_ptrs:
+                self._lib.aclshmem_free(p)
+            small_ptrs.clear()
+            self._print_memory_stats("After releasing all small blocks: ")
+
+            # Test 2: 申请释放交替进行（模拟真实使用场景，可能产生碎片）
+            print("\n--- Test 2: Allocate-Release Alternating (Fragmentation Test) ---")
+            alternating_ptrs = []
+            alternating_rounds = 10
+
+            for round in range(alternating_rounds):
+                # 每轮分配多个不同大小的块
+                print(f"\nRound {round + 1}: Allocating blocks...")
+                
+                # 使用多种大小的块，增加碎片产生的可能性
+                varied_sizes = [
+                    4096,    # 4K
+                    8192,    # 8K
+                    16384,   # 16K
+                    32768,   # 32K
+                    65536,   # 64K
+                    131072   # 128K
+                ]
+                
+                # 每轮分配3个随机大小的块
+                alloc_count_per_round = 3
+                for i in range(alloc_count_per_round):
+                    # 随机选择一个大小（使用轮数作为种子确保可重现）
+                    size = varied_sizes[(round + i) % len(varied_sizes)]
+                    ptr = self._lib.aclshmem_malloc(size)
+                    if ptr:
+                        alternating_ptrs.append(ptr)
+                        print(f"  Allocated {size // 1024}K at {hex(ptr)}")
+                    else:
+                        print(f"✗ Failed to allocate {size // 1024}K in round {round + 1}")
+                        for p in alternating_ptrs:
+                            self._lib.aclshmem_free(p)
+                        alternating_ptrs.clear()
+                        return False
+                
+                # 释放部分块（模拟随机释放导致的碎片）
+                print("  Releasing some blocks...")
+                
+                # 每轮释放已分配块的一半（向下取整），但至少保留1个
+                release_count = max(1, len(alternating_ptrs) // 2)
+                
+                # 从中间位置开始释放，模拟随机释放
+                start_release = len(alternating_ptrs) // 2
+                end_release = min(start_release + release_count, len(alternating_ptrs))
+                
+                # 释放选中的块
+                for i in range(start_release, end_release):
+                    if alternating_ptrs[i] is not None:
+                        self._lib.aclshmem_free(alternating_ptrs[i])
+                        print(f"  Released block at {hex(alternating_ptrs[i])}")
+                        alternating_ptrs[i] = None  # 标记为已释放
+                
+                # 清理已释放的空指针（保持列表整洁）
+                alternating_ptrs = [ptr for ptr in alternating_ptrs if ptr is not None]
+                
+                # 每10轮打印一次内存统计
+                if (round + 1) % 10 == 0:
+                    print(f"\nAfter round {round + 1}:")
+                    print(f"  Current allocated blocks: {len(alternating_ptrs)}")
+                    self._print_memory_stats("Memory status: ")
+
+            # 测试碎片对大内存分配的影响
+            print("\n--- Testing Large Allocation After Fragmentation ---")
+            
+            # 尝试分配一个较大的内存块（20MB）
+            large_size_mb = 20
+            large_size_bytes = large_size_mb * 1024 * 1024
+            print(f"Attempting to allocate {large_size_mb} MB block after fragmentation...")
+            
+            large_ptr = self._lib.aclshmem_malloc(large_size_bytes)
+            if large_ptr:
+                print(f"✓ Large allocation successful! Pointer: {hex(large_ptr)}")
+                self._lib.aclshmem_free(large_ptr)
+                print("✓ Large block released successfully")
+            else:
+                print("✗ Large allocation failed! This may indicate memory fragmentation issues.")
+                # 不要因为这个测试失败而返回false，因为这正是我们要观察的现象
+
+            # 释放剩余的块
+            print("\nReleasing remaining blocks...")
+            for p in alternating_ptrs:
+                self._lib.aclshmem_free(p)
+            alternating_ptrs.clear()
+            
+            self._print_memory_stats("Final memory status after all operations: ")
+            print("✓ Small granularity memory test completed successfully")
+            return True
+
+        except Exception as e:
+            print(f"✗ Exception occurred: {e}")
+            # 清理已分配的内存
+            for p in small_ptrs:
+                self._lib.aclshmem_free(p)
+            for p in alternating_ptrs:
+                if p is not None:
+                    self._lib.aclshmem_free(p)
+            return False
+
     # 测试主入口
 
     def run_all_tests(self):
@@ -575,9 +773,11 @@ class DynamicMemoryTester:
             return False
 
         test_cases = [
-            ("Sequential Allocation",   self.test_sequential_allocation),
-            ("Large Single Allocation", self.test_large_allocation),
-            ("Boundary Conditions",     self.test_boundary_conditions),
+            ("Sequential Allocation",       self.test_sequential_allocation),
+            ("Large Single Allocation",     self.test_large_allocation),
+            ("Incremental Release",         self.test_incremental_release),
+            ("Small Granularity Memory",    self.test_small_granularity_memory),
+            ("Boundary Conditions",         self.test_boundary_conditions),
         ]
 
         results = []

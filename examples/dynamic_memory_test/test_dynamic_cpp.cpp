@@ -12,6 +12,8 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <iomanip>
+#include <algorithm>
 #include "acl/acl.h"
 #include "shmem.h"
 
@@ -69,11 +71,20 @@ public:
         uint64_t total_capacity, used_memory, available_memory;
         aclshmem_get_memory_stats(&total_capacity, &used_memory, &available_memory);
         
+        // 转换为MB并保留三位小数，不四舍五入
+        auto toMB = [](uint64_t bytes) -> double {
+            double mb = bytes / (1024.0 * 1024.0);
+            // 不四舍五入，截断到三位小数
+            return static_cast<uint64_t>(mb * 1000) / 1000.0;
+        };
+        
         std::cout << prefix << "Memory Stats:" << std::endl;
-        std::cout << "  Total Capacity: " << total_capacity / (1024*1024) << " MB" << std::endl;
-        std::cout << "  Used Memory: " << used_memory / (1024*1024) << " MB" << std::endl;
-        std::cout << "  Available Memory: " << available_memory / (1024*1024) << " MB" << std::endl;
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "  Total Capacity: " << toMB(total_capacity) << " MB" << std::endl;
+        std::cout << "  Used Memory: " << toMB(used_memory) << " MB" << std::endl;
+        std::cout << "  Available Memory: " << toMB(available_memory) << " MB" << std::endl;
         std::cout << "  Utilization: " << (used_memory * 100.0 / total_capacity) << "%" << std::endl;
+        std::cout << std::defaultfloat; // 恢复默认输出格式
     }
     
     bool testSequentialAllocation() {
@@ -203,6 +214,188 @@ public:
         return true;
     }
     
+    bool testIncrementalRelease() {
+        std::cout << "\n=== Testing Incremental Release ===" << std::endl;
+        
+        printMemoryStats("Before allocation: ");
+        
+        std::vector<void*> allocated_ptrs;
+        std::vector<size_t> sizes_mb = {8, 12, 16, 20}; // MB
+        
+        // 分配多个内存块
+        for (size_t i = 0; i < sizes_mb.size(); i++) {
+            size_t size_bytes = sizes_mb[i] * 1024 * 1024;
+            std::cout << "\nAllocating " << sizes_mb[i] << " MB (block #" << (i+1) << ")..." << std::endl;
+            
+            void* ptr = aclshmem_malloc(size_bytes);
+            if (ptr) {
+                allocated_ptrs.push_back(ptr);
+                std::cout << "✓ Success! Pointer: " << ptr << std::endl;
+            } else {
+                std::cout << "✗ Failed to allocate " << sizes_mb[i] << " MB" << std::endl;
+                // 释放已分配的内存
+                for (void* p : allocated_ptrs) {
+                    aclshmem_free(p);
+                }
+                return false;
+            }
+        }
+        
+        printMemoryStats("After all allocations: ");
+        
+        // 逐个释放内存块，并在每次释放后打印内存统计
+        for (size_t i = 0; i < allocated_ptrs.size(); i++) {
+            std::cout << "\nReleasing block #" << (i+1) << " (pointer: " << allocated_ptrs[i] << ")..." << std::endl;
+            aclshmem_free(allocated_ptrs[i]);
+            std::cout << "✓ Block #" << (i+1) << " released successfully" << std::endl;
+            printMemoryStats("After release: ");
+        }
+        
+        printMemoryStats("After all releases: ");
+        return true;
+    }
+    
+    bool testSmallGranularityMemory() {
+        std::cout << "\n=== Testing Small Granularity Memory Operations ===" << std::endl;
+        
+        printMemoryStats("Initial state: ");
+        
+        // Test 1: 连续申请小粒度内存
+        std::cout << "\n--- Test 1: Continuous Small Allocations ---" << std::endl;
+        std::vector<void*> small_ptrs;
+        const size_t NUM_SMALL_ALLOCS = 100;
+        const size_t SMALL_SIZES[] = {4096, 65536}; // 4K, 64K
+        
+        for (size_t size : SMALL_SIZES) {
+            std::cout << "\nAllocating " << NUM_SMALL_ALLOCS << " blocks of " << size/1024 << "K each..." << std::endl;
+            
+            for (size_t i = 0; i < NUM_SMALL_ALLOCS; i++) {
+                void* ptr = aclshmem_malloc(size);
+                if (ptr) {
+                    small_ptrs.push_back(ptr);
+                } else {
+                    std::cout << "✗ Failed to allocate " << size/1024 << "K block #" << (i+1) << std::endl;
+                    // 释放已分配的内存
+                    for (void* p : small_ptrs) {
+                        aclshmem_free(p);
+                    }
+                    small_ptrs.clear();
+                    return false;
+                }
+            }
+            
+            std::cout << "✓ All " << NUM_SMALL_ALLOCS << " blocks of " << size/1024 << "K allocated successfully" << std::endl;
+            printMemoryStats("After allocation: ");
+        }
+        
+        // 释放所有小粒度内存
+        std::cout << "\nReleasing all small blocks..." << std::endl;
+        for (void* p : small_ptrs) {
+            aclshmem_free(p);
+        }
+        small_ptrs.clear();
+        printMemoryStats("After releasing all small blocks: ");
+        
+        // Test 2: 申请释放交替进行（模拟真实使用场景，可能产生碎片）
+        std::cout << "\n--- Test 2: Allocate-Release Alternating (Fragmentation Test) ---" << std::endl;
+        std::vector<void*> alternating_ptrs;
+        const size_t ALTERNATING_ROUNDS = 10;
+        
+        for (size_t round = 0; round < ALTERNATING_ROUNDS; round++) {
+            // 每轮分配多个不同大小的块（4种不同大小）
+            std::cout << "\nRound " << (round+1) << ": Allocating blocks..." << std::endl;
+            
+            // 使用多种大小的块，增加碎片产生的可能性
+            const std::vector<size_t> varied_sizes = {
+                4096,    // 4K
+                8192,    // 8K
+                16384,   // 16K
+                32768,   // 32K
+                65536,   // 64K
+                131072   // 128K
+            };
+            
+            // 每轮分配3个随机大小的块
+            const size_t ALLOC_COUNT_PER_ROUND = 3;
+            for (size_t i = 0; i < ALLOC_COUNT_PER_ROUND; i++) {
+                // 随机选择一个大小（使用轮数作为种子确保可重现）
+                size_t size = varied_sizes[(round + i) % varied_sizes.size()];
+                void* ptr = aclshmem_malloc(size);
+                if (ptr) {
+                    alternating_ptrs.push_back(ptr);
+                    std::cout << "  Allocated " << size/1024 << "K at " << ptr << std::endl;
+                } else {
+                    std::cout << "✗ Failed to allocate " << size/1024 << "K in round " << (round+1) << std::endl;
+                    for (void* p : alternating_ptrs) {
+                        aclshmem_free(p);
+                    }
+                    alternating_ptrs.clear();
+                    return false;
+                }
+            }
+            
+            // 释放部分块（模拟随机释放导致的碎片）
+            std::cout << "  Releasing some blocks..." << std::endl;
+            
+            // 每轮释放已分配块的一半（向下取整），但至少保留1个
+            size_t release_count = std::max(1ul, alternating_ptrs.size() / 2);
+            
+            // 从中间位置开始释放，模拟随机释放
+            size_t start_release = alternating_ptrs.size() / 2;
+            size_t end_release = std::min(start_release + release_count, alternating_ptrs.size());
+            
+            // 释放选中的块
+            for (size_t i = start_release; i < end_release; i++) {
+                if (alternating_ptrs[i] != nullptr) {
+                    aclshmem_free(alternating_ptrs[i]);
+                    std::cout << "  Released block at " << alternating_ptrs[i] << std::endl;
+                    alternating_ptrs[i] = nullptr; // 标记为已释放
+                }
+            }
+            
+            // 清理已释放的空指针（保持向量整洁）
+            auto it = std::remove(alternating_ptrs.begin(), alternating_ptrs.end(), nullptr);
+            alternating_ptrs.erase(it, alternating_ptrs.end());
+            
+            // 每10轮打印一次内存统计
+            if ((round+1) % 10 == 0) {
+                std::cout << "\nAfter round " << (round+1) << ":" << std::endl;
+                std::cout << "  Current allocated blocks: " << alternating_ptrs.size() << std::endl;
+                printMemoryStats("Memory status: ");
+            }
+        }
+        
+        // 测试碎片对大内存分配的影响
+        std::cout << "\n--- Testing Large Allocation After Fragmentation ---" << std::endl;
+        
+        // 尝试分配一个较大的内存块（20MB）
+        size_t large_size_mb = 20;
+        size_t large_size_bytes = large_size_mb * 1024 * 1024;
+        std::cout << "Attempting to allocate " << large_size_mb << " MB block after fragmentation..." << std::endl;
+        
+        void* large_ptr = aclshmem_malloc(large_size_bytes);
+        if (large_ptr) {
+            std::cout << "✓ Large allocation successful! Pointer: " << large_ptr << std::endl;
+            aclshmem_free(large_ptr);
+            std::cout << "✓ Large block released successfully" << std::endl;
+        } else {
+            std::cout << "✗ Large allocation failed! This may indicate memory fragmentation issues." << std::endl;
+            // 不要因为这个测试失败而返回false，因为这正是我们要观察的现象
+        }
+        
+        // 释放剩余的块
+        std::cout << "\nReleasing remaining blocks..." << std::endl;
+        for (void* p : alternating_ptrs) {
+            aclshmem_free(p);
+        }
+        alternating_ptrs.clear();
+        
+        printMemoryStats("Final memory status after all operations: ");
+        std::cout << "✓ Small granularity memory test completed successfully" << std::endl;
+        
+        return true;
+    }
+    
     void runAllTests() {
         std::cout << "========================================" << std::endl;
         std::cout << "SHMEM Dynamic Memory Expansion Test" << std::endl;
@@ -214,10 +407,12 @@ public:
         }
         
         int passed = 0;
-        int total = 3;
+        int total = 5;
         
         if (testSequentialAllocation()) passed++;
         if (testLargeAllocation()) passed++;
+        if (testIncrementalRelease()) passed++;
+        if (testSmallGranularityMemory()) passed++;
         if (testBoundaryConditions()) passed++;
         
         std::cout << "\n========================================" << std::endl;
