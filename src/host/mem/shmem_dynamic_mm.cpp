@@ -208,8 +208,7 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
                     it = slots.erase(it);
                 }
                 (void)it;  // suppress unused-variable warning after erase path
-                address_to_block_map_[aligned_start] = block.get();
-                external_alloc_info_map_[aligned_start] = {aligned_size, total_size};
+                address_to_block_map_[aligned_start] = {block.get(), aligned_size, total_size};
                 block->used_size += aligned_size;
                 update_block_statistics(block.get(), aligned_size);
                 pthread_spin_unlock(&spinlock_);
@@ -230,8 +229,7 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
         if (block->high_water + total_size <= block->size) {
             block->high_water += total_size;
             block->used_size += aligned_size;
-            address_to_block_map_[aligned_start] = block.get();
-            external_alloc_info_map_[aligned_start] = {aligned_size, total_size};
+            address_to_block_map_[aligned_start] = {block.get(), aligned_size, total_size};
             update_block_statistics(block.get(), aligned_size);
             pthread_spin_unlock(&spinlock_);
             SHM_LOG_DEBUG("Aligned allocated " << size << " bytes (bump, padding: "
@@ -313,19 +311,10 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
     // 2. 动态块路径：模型初始化时分配的外部块（较少调用，允许 O(log N)）
     auto it = address_to_block_map_.find(address);
     if (it != address_to_block_map_.end()) {
-        dynamic_memory_block* block = it->second;
-
-        // 获取准确的分配大小（aligned_allocate 有 padding，需区分 data_size 和 total_size）
-        auto info_it = external_alloc_info_map_.find(address);
-        uint64_t data_size = allocated_size_align_up(1);  // 默认使用对齐后的最小大小
-        uint64_t total_size = data_size;
-
-        if (info_it != external_alloc_info_map_.end()) {
-            data_size = info_it->second.first;
-            total_size = info_it->second.second;
-            external_alloc_info_map_.erase(info_it);
-        }
-
+        // 一次查找即可获取 block 指针和大小信息（原来需要两次 map 查找）
+        dynamic_memory_block* block = it->second.block;
+        uint64_t data_size  = it->second.data_size;
+        uint64_t total_size = it->second.total_size;
         address_to_block_map_.erase(it);
 
         // 更新活跃分配统计（used_size 只用于统计，不作为 bump 指针）
@@ -386,27 +375,32 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
 
 bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     // 注意：此函数假设调用者已持有 spinlock_
-    // 先解锁，避免长时间持有锁进行内存分配
+    // 先解锁，避免长时间持有锁期间执行耗时的 aclrtMalloc
     pthread_spin_unlock(&spinlock_);
 
-    // ── 计算期望扩容大小 ──────────────────────────────────────────────────────
-    // 至少分配 required_size，同时用 EXPANSION_FACTOR 预留余量减少下次扩容频率；
-    // 上限取 MAX_BLOCK_SIZE，确保不超出单块限制。
+    // ── 设计说明：不调用 aclrtGetMemInfo ────────────────────────────────────
+    // aclrtGetMemInfo(ACL_HBM_MEM) 是一个设备级查询，在 CANN/Ascend 上会触发
+    // NPU 流的隐式同步（等待所有 pending 算子完成），耗时可达数毫秒。
+    // 在推理热路径中（temp tensor 需要扩容时）调用会导致 NPU 流水线被清空，
+    // 显著增大 TTFT。
+    //
+    // 正确做法：直接尝试 aclrtMalloc，让驱动决定能否分配；失败则折半重试。
+    // OOM 保护通过 retry loop 实现（aclrtMalloc 失败 → 折半 → 直至成功或放弃），
+    // 不需要提前 probe 显存余量。这与基线代码行为一致，且不引入设备同步。
     constexpr uint64_t ALIGNMENT = 256 * 1024; // 256KB对齐
 
+    // ── 计算期望扩容大小 ──────────────────────────────────────────────────────
     uint64_t expansion_size = std::max(required_size, MIN_EXPANSION_SIZE);
     expansion_size = static_cast<uint64_t>(expansion_size * EXPANSION_FACTOR);
     expansion_size = std::min(expansion_size, MAX_BLOCK_SIZE);
-    // 对齐到 256KB
     expansion_size = (expansion_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    // 对齐后仍需满足 required_size
-    if (expansion_size < required_size) {
-        expansion_size = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    }
 
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
 
     // ── 分级尝试：优先分配期望大小，失败则逐步折半直到 required_size ──────────
+    // 折半重试保证了在显存紧张（高 gpu_memory_utilization）时也能正确分配：
+    // 如果 aclrtMalloc(big) 失败，说明显存不足，尝试更小的块；
+    // 直至 required_size 仍失败则返回 false，上层报错，不会 OOM。
     void* new_block_addr = nullptr;
     uint64_t try_size = expansion_size;
     uint64_t min_acceptable = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
@@ -423,7 +417,6 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
         if (try_size == min_acceptable) {
             break;  // 已是最小可接受大小，放弃
         }
-        // 折半，但不低于 min_acceptable
         try_size = std::max(try_size / 2, min_acceptable);
         try_size = (try_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
@@ -438,15 +431,12 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     // 内存分配成功，重新加锁更新元数据
     pthread_spin_lock(&spinlock_);
 
-    // 创建新的内存块管理结构
     auto new_block = std::make_unique<dynamic_memory_block>(new_block_addr, expansion_size, true);
     memory_blocks_.push_back(std::move(new_block));
-
     total_capacity_ += expansion_size;
 
     SHM_LOG_INFO("Successfully expanded memory pool. New block: " << new_block_addr
                  << ", size: " << expansion_size << ", total capacity: " << total_capacity_);
-
     return true;
 }
 
@@ -475,7 +465,7 @@ void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
             // 检查是否还有未释放的分配（双重检查）
             bool has_active_alloc = false;
             for (const auto& pair : address_to_block_map_) {
-                if (pair.second == block.get()) {
+                if (pair.second.block == block.get()) {
                     has_active_alloc = true;
                     break;
                 }
@@ -582,9 +572,7 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     }
 
     block->used_size += size;
-    address_to_block_map_[allocated_addr] = block;
-    // 记录分配信息：<数据大小, 总大小（无padding时等于数据大小）>
-    external_alloc_info_map_[allocated_addr] = {size, size};
+    address_to_block_map_[allocated_addr] = {block, size, size};
     update_block_statistics(block, size);
 
     return allocated_addr;
