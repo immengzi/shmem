@@ -11,6 +11,7 @@
 #define SHMEM_DYNAMIC_MM_H
 
 #include <pthread.h>
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -24,11 +25,17 @@
 struct dynamic_memory_block {
     void* base_addr;           // 内存块基地址
     uint64_t size;             // 内存块大小
-    uint64_t used_size;        // 已使用大小
+    uint64_t used_size;        // 当前活跃分配的字节总量（仅用于统计）
+    uint64_t high_water;       // bump指针：下一次分配的起始偏移（只增不减）
     bool is_external;          // 是否为外部CANN分配的内存
-    
-    dynamic_memory_block(void* addr, uint64_t block_size, bool external = false) 
-        : base_addr(addr), size(block_size), used_size(0), is_external(external) {}
+
+    // 外部块空闲槽位列表：{偏移, 大小}，按大小排序以支持best-fit复用
+    // 仅用于 is_external == true 的块
+    std::vector<std::pair<uint64_t, uint64_t>> free_slots;
+
+    dynamic_memory_block(void* addr, uint64_t block_size, bool external = false)
+        : base_addr(addr), size(block_size), used_size(0), high_water(0),
+          is_external(external) {}
 };
 
 // 动态扩容内存管理器
