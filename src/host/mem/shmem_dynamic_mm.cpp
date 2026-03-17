@@ -254,12 +254,68 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
     
     pthread_spin_lock(&spinlock_);
     
-    // 1. 首先检查是否在动态内存块中（优先检查，避免地址范围重叠误判）
+    // ── 查找顺序说明 ──────────────────────────────────────────────────────────
+    // 性能关键：推理热路径中临时 tensor（Q/K/V/FFN 中间值）大量从初始池分配/释放。
+    // 初始池检查是 O(1) 指针比较；address_to_block_map_.find() 是 O(log N) BST 遍历，
+    // N = 动态块活跃分配数（模型权重可达数百~数千条），每次有多次 cache miss。
+    // 若先做 map 查找再做池检查，则每次初始池 release 都会做一次必然失败的 O(log N) 查找，
+    // 系统性地增加 TTFT 延迟（min/avg/max 全部变大）。
+    //
+    // 正确处理"地址重叠边界"：如果 CANN 分配的地址恰好落在初始池虚拟地址范围内，
+    // address_used_tree_.find(offset) 会返回 end()（不是初始池分配），
+    // 代码 fall-through 到 address_to_block_map_ 检查——无需反转顺序。
+
+    // 1. 初始池快速路径：O(1) 范围检查 + 精确 used_tree 确认
+    if (u8a >= initial_base_ && u8a < initial_base_ + initial_size_) {
+        auto offset = u8a - initial_base_;
+        auto pos_used = address_used_tree_.find(offset);
+        if (pos_used != address_used_tree_.end()) {
+            // 确认是初始池分配，按原有逻辑释放
+            auto size = pos_used->second;
+            uint64_t final_offset = static_cast<uint64_t>(offset);
+            uint64_t final_size = size;
+            address_used_tree_.erase(pos_used);
+
+            auto prev_addr_pos = address_idle_tree_.lower_bound(offset);
+            if (prev_addr_pos != address_idle_tree_.begin()) {
+                --prev_addr_pos;
+                if (prev_addr_pos != address_idle_tree_.end() &&
+                    prev_addr_pos->first + prev_addr_pos->second == static_cast<uint64_t>(offset)) {
+                    final_offset = prev_addr_pos->first;
+                    final_size += prev_addr_pos->second;
+                    auto prev_addr_range = *prev_addr_pos;
+                    address_idle_tree_.erase(prev_addr_pos);
+                    size_idle_tree_.erase(memory_range{prev_addr_range.first, prev_addr_range.second});
+                }
+            }
+
+            auto next_addr_pos = address_idle_tree_.find(offset + size);
+            if (next_addr_pos != address_idle_tree_.end()) {
+                uint64_t next_addr = next_addr_pos->first;
+                uint64_t next_size = next_addr_pos->second;
+                final_size += next_size;
+                address_idle_tree_.erase(next_addr_pos);
+                size_idle_tree_.erase(memory_range{next_addr, next_size});
+            }
+
+            address_idle_tree_.emplace(final_offset, final_size);
+            size_idle_tree_.emplace(memory_range{final_offset, final_size});
+            update_block_statistics(memory_blocks_[0].get(), -static_cast<int64_t>(size));
+
+            pthread_spin_unlock(&spinlock_);
+            SHM_LOG_DEBUG("Released memory at " << address << " from initial pool");
+            return 0;
+        }
+        // address_used_tree_ 未命中：地址在初始池范围但不是初始池分配
+        // （CANN 地址重叠边界情况），fall-through 到动态块检查
+    }
+
+    // 2. 动态块路径：模型初始化时分配的外部块（较少调用，允许 O(log N)）
     auto it = address_to_block_map_.find(address);
     if (it != address_to_block_map_.end()) {
         dynamic_memory_block* block = it->second;
 
-        // 获取准确的分配大小进行统计修正
+        // 获取准确的分配大小（aligned_allocate 有 padding，需区分 data_size 和 total_size）
         auto info_it = external_alloc_info_map_.find(address);
         uint64_t data_size = allocated_size_align_up(1);  // 默认使用对齐后的最小大小
         uint64_t total_size = data_size;
@@ -280,18 +336,15 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
         }
 
         // 将归还区域按 offset 有序插入 vector（lower_bound + insert），然后就地合并相邻槽。
-        // 使用 vector 而非 map：N 通常 < 10，vector 无堆分配、缓存友好，
-        // 推理热路径（每层 Q/K/V 分配释放）中比 map 快一个量级。
+        // 使用 vector 而非 map：N 通常 < 10，vector 无堆分配、缓存友好。
         // high_water 保持不变，只有 bump 区域全空时才回退。
         uint64_t freed_offset = static_cast<uint64_t>(
             static_cast<uint8_t*>(address) -
             static_cast<uint8_t*>(block->base_addr));
 
         auto& slots = block->free_slots;
-        // O(log n) 定位插入位置
         auto pos = std::lower_bound(slots.begin(), slots.end(),
                                     std::make_pair(freed_offset, uint64_t(0)));
-        // O(n) 原地插入（n 极小，无堆分配，比 map::insert 快）
         pos = slots.insert(pos, {freed_offset, total_size});
 
         // 向后合并：pos 末尾紧接 next 起始
@@ -324,51 +377,8 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
                       << " high_water=" << block->high_water);
         return 0;
     }
-    
-    // 2. 检查是否在初始内存池中（使用精确的偏移量查找）
-    if (u8a >= initial_base_ && u8a < initial_base_ + initial_size_) {
-        auto offset = u8a - initial_base_;
-        auto pos = address_used_tree_.find(offset);
-        if (pos != address_used_tree_.end()) {
-            auto size = pos->second;
-            uint64_t final_offset = static_cast<uint64_t>(offset);
-            uint64_t final_size = size;
-            address_used_tree_.erase(pos);
 
-            // 合并空闲块
-            auto prev_addr_pos = address_idle_tree_.lower_bound(offset);
-            if (prev_addr_pos != address_idle_tree_.begin()) {
-                --prev_addr_pos;
-                if (prev_addr_pos != address_idle_tree_.end() &&
-                    prev_addr_pos->first + prev_addr_pos->second == static_cast<uint64_t>(offset)) {
-                    final_offset = prev_addr_pos->first;
-                    final_size += prev_addr_pos->second;
-                    auto prev_addr_range = *prev_addr_pos;
-                    address_idle_tree_.erase(prev_addr_pos);
-                    size_idle_tree_.erase(memory_range{prev_addr_range.first, prev_addr_range.second});
-                }
-            }
-
-            auto next_addr_pos = address_idle_tree_.find(offset + size);
-            if (next_addr_pos != address_idle_tree_.end()) {
-                uint64_t next_addr = next_addr_pos->first;
-                uint64_t next_size = next_addr_pos->second;
-                final_size += next_size;
-                address_idle_tree_.erase(next_addr_pos);
-                size_idle_tree_.erase(memory_range{next_addr, next_size});
-            }
-            
-            address_idle_tree_.emplace(final_offset, final_size);
-            size_idle_tree_.emplace(memory_range{final_offset, final_size});
-            update_block_statistics(memory_blocks_[0].get(), -static_cast<int64_t>(size));
-            
-            pthread_spin_unlock(&spinlock_);
-            SHM_LOG_DEBUG("Released memory at " << address << " from initial pool");
-            return 0;
-        }
-    }
-    
-    // 地址未找到
+    // 3. 地址未找到
     pthread_spin_unlock(&spinlock_);
     SHM_LOG_ERROR("Release invalid address " << address);
     return -1;
