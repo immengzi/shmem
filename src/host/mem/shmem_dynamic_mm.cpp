@@ -208,7 +208,9 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
                     it = slots.erase(it);
                 }
                 (void)it;  // suppress unused-variable warning after erase path
-                address_to_block_map_[aligned_start] = {block.get(), aligned_size, total_size};
+                // block_offset = slot_offset (pre-padding start), so release() returns
+                // the full [slot_offset, slot_offset+total_size) range to free_slots.
+                address_to_block_map_[aligned_start] = {block.get(), aligned_size, total_size, slot_offset};
                 block->used_size += aligned_size;
                 update_block_statistics(block.get(), aligned_size);
                 pthread_spin_unlock(&spinlock_);
@@ -227,9 +229,11 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
         uint64_t total_size = padding_size + aligned_size;
 
         if (block->high_water + total_size <= block->size) {
+            uint64_t slot_offset_bump = block->high_water;  // pre-increment offset
             block->high_water += total_size;
             block->used_size += aligned_size;
-            address_to_block_map_[aligned_start] = {block.get(), aligned_size, total_size};
+            // block_offset = pre-padding start; release() uses this to restore full slot.
+            address_to_block_map_[aligned_start] = {block.get(), aligned_size, total_size, slot_offset_bump};
             update_block_statistics(block.get(), aligned_size);
             pthread_spin_unlock(&spinlock_);
             SHM_LOG_DEBUG("Aligned allocated " << size << " bytes (bump, padding: "
@@ -312,14 +316,16 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
     auto it = address_to_block_map_.find(address);
     if (it != address_to_block_map_.end()) {
         // 一次查找即可获取 block 指针和大小信息（原来需要两次 map 查找）
-        dynamic_memory_block* block = it->second.block;
+        dynamic_memory_block* block       = it->second.block;
         uint64_t data_size  = it->second.data_size;
         uint64_t total_size = it->second.total_size;
+        uint64_t block_offset = it->second.block_offset;  // save before erase
         address_to_block_map_.erase(it);
 
         // 更新活跃分配统计（used_size 只用于统计，不作为 bump 指针）
-        if (block->used_size >= total_size) {
-            block->used_size -= total_size;
+        // 使用 data_size（不含 padding）与分配时 block->used_size += data_size 对称。
+        if (block->used_size >= data_size) {
+            block->used_size -= data_size;
         } else {
             block->used_size = 0;  // 防止下溢
         }
@@ -327,9 +333,11 @@ int32_t dynamic_memory_manager::release(void *address) noexcept {
         // 将归还区域按 offset 有序插入 vector（lower_bound + insert），然后就地合并相邻槽。
         // 使用 vector 而非 map：N 通常 < 10，vector 无堆分配、缓存友好。
         // high_water 保持不变，只有 bump 区域全空时才回退。
-        uint64_t freed_offset = static_cast<uint64_t>(
-            static_cast<uint8_t*>(address) -
-            static_cast<uint8_t*>(block->base_addr));
+        //
+        // 使用 block_offset 而非从 address 重新计算偏移：对于对齐分配，address 是
+        // 对齐后的指针（含 pre-padding），直接相减会丢失 pre-padding 字节，导致归还
+        // 区间错位，产生内存泄漏或越界写入。block_offset 在分配时记录了真实的槽起始。
+        uint64_t freed_offset = block_offset;
 
         auto& slots = block->free_slots;
         auto pos = std::lower_bound(slots.begin(), slots.end(),
@@ -572,7 +580,9 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
     }
 
     block->used_size += size;
-    address_to_block_map_[allocated_addr] = {block, size, size};
+    uint64_t block_off = static_cast<uint64_t>(
+        static_cast<uint8_t*>(allocated_addr) - static_cast<uint8_t*>(block->base_addr));
+    address_to_block_map_[allocated_addr] = {block, size, size, block_off};
     update_block_statistics(block, size);
 
     return allocated_addr;

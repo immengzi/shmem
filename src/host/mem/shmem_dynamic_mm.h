@@ -81,8 +81,9 @@ private:
     // 每次动态块 alloc/free 只需一次 O(log N) 查找（原来是两次）。
     struct DynAllocInfo {
         dynamic_memory_block* block;
-        uint64_t data_size;   // 实际分配的数据大小
-        uint64_t total_size;  // 含对齐 padding 的总大小（用于 free_slots 归还）
+        uint64_t data_size;    // 实际分配的数据大小
+        uint64_t total_size;   // 含对齐 padding 的总大小（用于 free_slots 归还）
+        uint64_t block_offset; // 内存块内起始偏移（含 pre-padding，used by release()）
     };
     std::vector<std::unique_ptr<dynamic_memory_block>> memory_blocks_;
     std::map<void*, DynAllocInfo> address_to_block_map_;
