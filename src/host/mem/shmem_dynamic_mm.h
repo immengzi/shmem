@@ -68,9 +68,7 @@ private:
                                   uint64_t &head_skip) noexcept;
     // 动态扩容辅助函数
     dynamic_memory_block* find_suitable_block(uint64_t size) noexcept;
-    // from_free_slot: 可选出参，置 true 表示内存来自 free_slots（脏内存，调用方需清零）
-    void* allocate_from_block(dynamic_memory_block* block, uint64_t size,
-                               bool* from_free_slot = nullptr) noexcept;
+    void* allocate_from_block(dynamic_memory_block* block, uint64_t size) noexcept;
     void update_block_statistics(dynamic_memory_block* block, int64_t size_delta) noexcept;
 
 private:
