@@ -88,7 +88,10 @@ void *dynamic_memory_manager::allocate(uint64_t size) noexcept {
             ptr = initial_base_ + target_offset;
             update_block_statistics(memory_blocks_[0].get(), aligned_size);
             pthread_spin_unlock(&spinlock_);
-            
+
+            // 初始池的槽位可能已被前一次分配写入（e.g. 前一个请求的 KV cache），
+            // 必须清零防止残留数据泄漏到新请求。解锁后执行，不阻塞热路径。
+            aclrtMemset(ptr, aligned_size, 0, aligned_size);
             SHM_LOG_DEBUG("Allocated " << size << " bytes from initial pool at " << ptr);
             return ptr;
         }
@@ -97,9 +100,15 @@ void *dynamic_memory_manager::allocate(uint64_t size) noexcept {
     // 2. 在动态内存块中寻找合适的块
     dynamic_memory_block* suitable_block = find_suitable_block(aligned_size);
     if (suitable_block != nullptr) {
-        ptr = allocate_from_block(suitable_block, aligned_size);
+        bool from_slot = false;
+        ptr = allocate_from_block(suitable_block, aligned_size, &from_slot);
         if (ptr != nullptr) {
             pthread_spin_unlock(&spinlock_);
+            // free_slots 复用的内存含有前一次分配的残留数据，必须清零。
+            // bump 区域来自 aclrtMalloc 新页，CANN 保证首次访问为零，无需清零。
+            if (from_slot) {
+                aclrtMemset(ptr, aligned_size, 0, aligned_size);
+            }
             SHM_LOG_DEBUG("Allocated " << size << " bytes from dynamic block at " << ptr);
             return ptr;
         }
@@ -113,20 +122,26 @@ void *dynamic_memory_manager::allocate(uint64_t size) noexcept {
         return nullptr;
     }
     
-    // 扩容后再次尝试分配
+    // 扩容后再次尝试分配。新扩容的块刚由 aclrtMalloc 分配，bump 区域为全新物理页，
+    // CANN 驱动保证首次访问为零；from_slot 为 false，不需要额外清零。
+    bool from_slot_after_expand = false;
     suitable_block = find_suitable_block(aligned_size);
     if (suitable_block != nullptr) {
-        ptr = allocate_from_block(suitable_block, aligned_size);
+        ptr = allocate_from_block(suitable_block, aligned_size, &from_slot_after_expand);
     }
-    
+
     pthread_spin_unlock(&spinlock_);
-    
+
     if (ptr != nullptr) {
+        if (from_slot_after_expand) {
+            // 极少数情况：扩容后恰好复用了某个残留 free_slot，仍需清零
+            aclrtMemset(ptr, aligned_size, 0, aligned_size);
+        }
         SHM_LOG_DEBUG("Allocated " << size << " bytes from expanded pool at " << ptr);
     } else {
         SHM_LOG_ERROR("Failed to allocate " << size << " bytes even after expansion");
     }
-    
+
     return ptr;
 }
 
@@ -213,6 +228,8 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
                 block->used_size += aligned_size;
                 update_block_statistics(block.get(), aligned_size);
                 pthread_spin_unlock(&spinlock_);
+                // free_slots 复用：内存含有前一次分配的残留数据，解锁后清零防止数据污染。
+                aclrtMemset(aligned_start, aligned_size, 0, aligned_size);
                 SHM_LOG_DEBUG("Aligned allocated " << size << " bytes (slot, padding: "
                               << padding_size << ") from dynamic block at " << (void*)aligned_start);
                 return aligned_start;
@@ -529,7 +546,8 @@ dynamic_memory_block* dynamic_memory_manager::find_suitable_block(uint64_t size)
     return nullptr;
 }
 
-void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, uint64_t size) noexcept {
+void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, uint64_t size,
+                                                   bool* from_free_slot) noexcept {
     if (!block->is_external) {
         return nullptr; // 初始内存池不应该通过此函数分配
     }
@@ -560,10 +578,14 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
             block->free_slots.erase(best_it);
         }
         allocated_addr = block_start + slot_offset;
+        // 标记：此内存来自 free_slots，可能含有上一次分配的残留数据（脏内存），
+        // 调用方需在解锁后调用 aclrtMemset 清零，防止数据泄漏到新请求。
+        if (from_free_slot) *from_free_slot = true;
         SHM_LOG_DEBUG("Reusing free slot at offset " << slot_offset
                       << " (slot=" << slot_size << " req=" << size << ")");
     } else {
-        // 没有合适的槽位，从 bump 区域分配
+        // 没有合适的槽位，从 bump 区域分配。
+        // bump 区域来自 aclrtMalloc 的新物理页，CANN 驱动保证首次访问时为零，无需清零。
         if (block->size - block->high_water < size) {
             // 防御：不应该发生（调用前已通过 find_suitable_block 检查）
             SHM_LOG_ERROR("allocate_from_block: bump area exhausted unexpectedly");
@@ -571,6 +593,7 @@ void* dynamic_memory_manager::allocate_from_block(dynamic_memory_block* block, u
         }
         allocated_addr = block_start + block->high_water;
         block->high_water += size;
+        if (from_free_slot) *from_free_slot = false;
     }
 
     block->used_size += size;
