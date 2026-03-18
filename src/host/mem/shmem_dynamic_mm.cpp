@@ -190,7 +190,6 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
 
         // 先尝试从空闲槽位 map 中找到合适的对齐槽
         auto& slots = block->free_slots;
-        bool slot_found = false;
         for (auto it = slots.begin(); it != slots.end(); ++it) {
             uint8_t* slot_ptr = block_start + it->first;
             uint8_t* aligned_start = reinterpret_cast<uint8_t*>(
@@ -219,7 +218,6 @@ void *dynamic_memory_manager::aligned_allocate(uint64_t alignment, uint64_t size
                 return aligned_start;
             }
         }
-        if (slot_found) continue;
 
         // 从 bump 区域分配（high_water 只增不减，避免重叠）
         uint8_t* bump_ptr = block_start + block->high_water;
@@ -461,58 +459,54 @@ uint64_t dynamic_memory_manager::get_available_memory() const noexcept {
 }
 
 void dynamic_memory_manager::cleanup_unused_blocks() noexcept {
+    // ── 设计说明 ──────────────────────────────────────────────────────────────
+    // aclrtFree() 是 NPU 驱动调用，可能触发设备同步，耗时 ms 级。
+    // 不能在持有 spinlock_ 的情况下调用，否则会阻塞推理热路径中的所有 alloc/free。
+    //
+    // 正确做法：
+    //   1. 持锁阶段：扫描 memory_blocks_，将满足条件的块从 vector 移出（转移
+    //      unique_ptr 所有权），同时更新 total_capacity_。此阶段只做内存中的
+    //      数据结构操作，O(M)，耗时极短。
+    //   2. 解锁后：对收集到的块逐一调用 aclrtFree()，与热路径并行，不阻塞。
+    //
+    // 冗余双重检查说明：
+    //   原代码对每个候选块做 O(K) 全量扫描 address_to_block_map_ 来确认无活跃
+    //   分配。这是不必要的：每次 allocate_from_block() 都会递增 block->used_size，
+    //   每次 release() 都会递减它并从 map 中移除对应条目。因此：
+    //     used_size == 0 && free_slots.empty() ⟺ 该块无任何活跃或待合并的分配
+    //   无需二次扫描。
+
+    std::vector<std::unique_ptr<dynamic_memory_block>> to_free;
+
     pthread_spin_lock(&spinlock_);
-    
-    uint64_t freed_count = 0;
-    uint64_t freed_size = 0;
-    
-    // 清理完全空闲的外部内存块（used_size == 0 且没有活跃分配）
     for (auto it = memory_blocks_.begin(); it != memory_blocks_.end();) {
         auto& block = *it;
         if (block->is_external && block->used_size == 0 && block->free_slots.empty()) {
-            // 检查是否还有未释放的分配（双重检查）
-            bool has_active_alloc = false;
-            for (const auto& pair : address_to_block_map_) {
-                if (pair.second.block == block.get()) {
-                    has_active_alloc = true;
-                    break;
-                }
-            }
-            
-            if (has_active_alloc) {
-                SHM_LOG_WARN("Block at " << block->base_addr << " has used_size=0 but active allocations exist");
-                ++it;
-                continue;
-            }
-            
-            // 释放 CANN 内存
-            if (block->base_addr != nullptr) {
-                aclrtFree(block->base_addr);
-                freed_size += block->size;
-                freed_count++;
-                SHM_LOG_INFO("Freed unused external memory block: " << block->base_addr 
-                             << " (size: " << block->size << ")");
-            }
-            
-            // 更新总容量
             total_capacity_ -= block->size;
-            
-            // 从 vector 中移除
+            to_free.push_back(std::move(*it));
             it = memory_blocks_.erase(it);
         } else {
             ++it;
         }
     }
-    
     pthread_spin_unlock(&spinlock_);
-    
-    if (freed_count > 0) {
-        SHM_LOG_INFO("Memory cleanup completed. Freed " << freed_count << " blocks (" 
-                     << freed_size << " bytes). Current capacity: " << total_capacity_ 
+
+    // 锁外释放 NPU 内存，避免阻塞热路径
+    for (auto& block : to_free) {
+        if (block->base_addr != nullptr) {
+            SHM_LOG_INFO("Freeing unused external memory block: " << block->base_addr
+                         << " (size: " << block->size << ")");
+            aclrtFree(block->base_addr);
+        }
+    }
+
+    if (!to_free.empty()) {
+        SHM_LOG_INFO("Memory cleanup completed. Freed " << to_free.size() << " blocks."
+                     << " Current capacity: " << total_capacity_
                      << ", allocated: " << total_allocated_);
     } else {
-        SHM_LOG_DEBUG("Memory cleanup completed. No blocks freed. Current capacity: " 
-                      << total_capacity_ << ", allocated: " << total_allocated_);
+        SHM_LOG_DEBUG("Memory cleanup: no blocks freed. Capacity: " << total_capacity_
+                      << ", allocated: " << total_allocated_);
     }
 }
 
