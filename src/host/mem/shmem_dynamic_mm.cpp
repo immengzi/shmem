@@ -376,8 +376,8 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     expansion_size = static_cast<uint64_t>(expansion_size * EXPANSION_FACTOR);
     expansion_size = std::min(expansion_size, MAX_BLOCK_SIZE);
 
-    // 确保对齐
-    constexpr uint64_t ALIGNMENT = 256 * 1024; // 256KB对齐
+    // NPU device memory uses 2MB large pages
+    constexpr uint64_t ALIGNMENT = 2 * 1024 * 1024; // 2MB对齐
     expansion_size = (expansion_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
     // 最小可用大小：必须能容纳请求的分配
@@ -386,12 +386,13 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
 
     // 尝试分配，失败时逐步减半重试，直到最小可用大小
+    // 向下对齐（非向上）避免死循环
     void* new_block_addr = nullptr;
     aclError ret = ACL_ERROR_RT_MEMORY_ALLOCATION;
 
     for (uint64_t try_size = expansion_size;
          try_size >= min_size;
-         try_size = (try_size / 2 + ALIGNMENT - 1) & ~(ALIGNMENT - 1)) {
+         try_size = try_size / 2 & ~(ALIGNMENT - 1)) {
         ret = aclrtMalloc(&new_block_addr, try_size, ACL_MEM_MALLOC_HUGE_FIRST);
         if (ret == ACL_SUCCESS && new_block_addr != nullptr) {
             expansion_size = try_size;
