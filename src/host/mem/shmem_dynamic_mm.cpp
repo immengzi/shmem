@@ -14,8 +14,8 @@
 #include "shmem_dynamic_mm.h"
 
 // 内存扩容策略常量
-constexpr uint64_t MIN_EXPANSION_SIZE = 256 * 1024 * 1024;  // 256MB最小扩容
-constexpr double EXPANSION_FACTOR = 1.5;                    // 1.5倍扩容因子
+constexpr uint64_t MIN_EXPANSION_SIZE = 2 * 1024 * 1024;    // 2MB最小扩容（一个NPU大页）
+constexpr double EXPANSION_FACTOR = 1.0;                    // 精确分配，不做投机预分配
 constexpr uint64_t MAX_BLOCK_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB最大单块
 
 dynamic_memory_manager::dynamic_memory_manager(void *base, uint64_t initial_size) noexcept 
