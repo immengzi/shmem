@@ -14,8 +14,8 @@
 #include "shmem_dynamic_mm.h"
 
 // 内存扩容策略常量
-constexpr uint64_t MIN_EXPANSION_SIZE = 256 * 1024 * 1024;  // 256MB最小扩容
-constexpr double EXPANSION_FACTOR = 1.5;                    // 1.5倍扩容因子
+constexpr uint64_t MIN_EXPANSION_SIZE = 2 * 1024 * 1024;    // 2MB最小扩容（一个NPU大页）
+constexpr double EXPANSION_FACTOR = 1.0;                    // 精确分配，不做投机预分配
 constexpr uint64_t MAX_BLOCK_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB最大单块
 
 dynamic_memory_manager::dynamic_memory_manager(void *base, uint64_t initial_size) noexcept 
@@ -370,43 +370,59 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     // 注意：此函数假设调用者已持有 spinlock_
     // 先解锁，避免长时间持有锁进行内存分配
     pthread_spin_unlock(&spinlock_);
-    
+
     // 计算需要的扩容大小
     uint64_t expansion_size = std::max(required_size, MIN_EXPANSION_SIZE);
     expansion_size = static_cast<uint64_t>(expansion_size * EXPANSION_FACTOR);
     expansion_size = std::min(expansion_size, MAX_BLOCK_SIZE);
-    
-    // 确保对齐
-    constexpr uint64_t ALIGNMENT = 256 * 1024; // 256KB对齐
+
+    // NPU device memory uses 2MB large pages
+    constexpr uint64_t ALIGNMENT = 2 * 1024 * 1024; // 2MB对齐
     expansion_size = (expansion_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    
+
+    // 最小可用大小：必须能容纳请求的分配
+    uint64_t min_size = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
-    
-    // 使用CANN接口分配新的内存块（此时不持有锁，允许其他线程并行）
+
+    // 尝试分配，失败时逐步减半重试，直到最小可用大小
+    // 向下对齐（非向上）避免死循环
     void* new_block_addr = nullptr;
-    aclError ret = aclrtMalloc(&new_block_addr, expansion_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    
+    aclError ret = ACL_ERROR_RT_MEMORY_ALLOCATION;
+
+    for (uint64_t try_size = expansion_size;
+         try_size >= min_size;
+         try_size = try_size / 2 & ~(ALIGNMENT - 1)) {
+        ret = aclrtMalloc(&new_block_addr, try_size, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (ret == ACL_SUCCESS && new_block_addr != nullptr) {
+            expansion_size = try_size;
+            break;
+        }
+        new_block_addr = nullptr;
+        SHM_LOG_INFO("aclrtMalloc failed for size " << try_size
+                     << ", retrying with smaller size");
+    }
+
     if (ret != ACL_SUCCESS || new_block_addr == nullptr) {
-        SHM_LOG_ERROR("Failed to allocate external memory block of size " << expansion_size 
-                      << ", error code: " << ret);
+        SHM_LOG_ERROR("Failed to allocate memory block, min size "
+                      << min_size << ", error code: " << ret);
         // 重新加锁，保持锁状态一致性
         pthread_spin_lock(&spinlock_);
         return false;
     }
-    
+
     // 内存分配成功，重新加锁更新元数据
     pthread_spin_lock(&spinlock_);
-    
+
     // 创建新的内存块管理结构
     auto new_block = std::make_unique<dynamic_memory_block>(new_block_addr, expansion_size, true);
-    dynamic_memory_block* block_ptr = new_block.get();
     memory_blocks_.push_back(std::move(new_block));
-    
+
     total_capacity_ += expansion_size;
-    
-    SHM_LOG_INFO("Successfully expanded memory pool. New block: " << new_block_addr 
+
+    SHM_LOG_INFO("Successfully expanded memory pool. New block: " << new_block_addr
                  << ", size: " << expansion_size << ", total capacity: " << total_capacity_);
-    
+
     return true;
 }
 
