@@ -36,6 +36,31 @@ constexpr uint32_t DEFAULT_SDMA_UB_SIZE = 64;
 constexpr int64_t DEFAULT_SDMA_UB_OFFSET = 191 * 1024;
 constexpr uint32_t DEFAULT_RDMA_UB_SIZE = 64;
 constexpr int64_t DEFAULT_RDMA_UB_OFFSET = 190 * 1024;
+constexpr int64_t LOCAL_MEM_ALIGNMENT = 2LL * 1024 * 1024;
+
+namespace {
+
+int64_t align_up_local_mem_size(int64_t value)
+{
+    return ((value + LOCAL_MEM_ALIGNMENT - 1) / LOCAL_MEM_ALIGNMENT) *
+           LOCAL_MEM_ALIGNMENT;
+}
+
+void normalize_local_mem_size(int64_t &local_mem_size)
+{
+    if (local_mem_size <= 0) {
+        return;
+    }
+    int64_t aligned_local_mem_size = align_up_local_mem_size(local_mem_size);
+    if (aligned_local_mem_size != local_mem_size) {
+        SHM_LOG_WARN("Round local_mem_size from " << local_mem_size
+                     << " to " << aligned_local_mem_size
+                     << " bytes to satisfy 2MB heap alignment");
+        local_mem_size = aligned_local_mem_size;
+    }
+}
+
+} // namespace
 
 // initializer
 #define ACLSHMEM_DEVICE_HOST_STATE_INITIALIZER                                                         \
@@ -108,6 +133,7 @@ bool is_valid_data_op_engine_type(data_op_engine_type_t value)
 
 int32_t check_attr(aclshmemx_init_attr_t *attributes)
 {
+    normalize_local_mem_size(attributes->local_mem_size);
     SHM_LOG_DEBUG("check_attr my_pe=" << attributes->my_pe << " n_pes=" << attributes->n_pes << " local_mem_size=" << attributes->local_mem_size
                                       << " shm_init_timeout=" << attributes->option_attr.shm_init_timeout
                                       << " control_operation_timeout=" << attributes->option_attr.control_operation_timeout);
@@ -157,6 +183,8 @@ int aclshmemx_set_attr_uniqueid_args(int my_pe, int n_pes, int64_t local_mem_siz
                                     aclshmemx_uniqueid_t *uid,
                                     aclshmemx_init_attr_t *aclshmem_attr) {
     /* Save to uid_args */
+    SHM_ASSERT_RETURN(local_mem_size > 0, ACLSHMEM_INVALID_VALUE);
+    normalize_local_mem_size(local_mem_size);
     SHM_ASSERT_RETURN(local_mem_size <= ACLSHMEM_MAX_LOCAL_SIZE, ACLSHMEM_INVALID_VALUE);
     SHM_ASSERT_RETURN(n_pes <= ACLSHMEM_MAX_PES, ACLSHMEM_INVALID_VALUE);
     SHM_ASSERT_RETURN(my_pe < ACLSHMEM_MAX_PES, ACLSHMEM_INVALID_VALUE);

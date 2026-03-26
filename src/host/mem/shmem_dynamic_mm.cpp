@@ -13,10 +13,21 @@
 #include "shmemi_host_common.h"
 #include "shmem_dynamic_mm.h"
 
-// 内存扩容策略常量
-constexpr uint64_t MIN_EXPANSION_SIZE = 2 * 1024 * 1024;    // 2MB最小扩容（一个NPU大页）
-constexpr double EXPANSION_FACTOR = 1.0;                    // 精确分配，不做投机预分配
+// 内存扩容/对齐策略常量
+constexpr uint64_t LARGE_PAGE_SIZE = 2ULL * 1024 * 1024;        // 2MB大页
+constexpr uint64_t MIN_EXPANSION_SIZE = 32ULL * 1024 * 1024;    // 32MB最小扩容，减少扩容抖动
+constexpr double EXPANSION_FACTOR = 1.0;                        // 精确分配，不做投机预分配
 constexpr uint64_t MAX_BLOCK_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB最大单块
+constexpr uint64_t SMALL_ALLOC_ALIGNMENT = 512ULL;
+constexpr uint64_t SMALL_ALLOC_THRESHOLD = 1ULL * 1024 * 1024;   // 1MB
+constexpr uint64_t MEDIUM_ALLOC_ALIGNMENT = LARGE_PAGE_SIZE;
+constexpr uint64_t MEDIUM_ALLOC_THRESHOLD = 16ULL * 1024 * 1024; // 16MB
+constexpr uint64_t LARGE_ALLOC_ALIGNMENT = 16ULL * 1024 * 1024;  // 16MB
+
+inline uint64_t align_up(uint64_t value, uint64_t alignment) noexcept
+{
+    return (value + alignment - 1UL) & ~(alignment - 1UL);
+}
 
 dynamic_memory_manager::dynamic_memory_manager(void *base, uint64_t initial_size) noexcept 
     : initial_base_{reinterpret_cast<uint8_t *>(base)}, 
@@ -377,11 +388,10 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
     expansion_size = std::min(expansion_size, MAX_BLOCK_SIZE);
 
     // NPU device memory uses 2MB large pages
-    constexpr uint64_t ALIGNMENT = 2 * 1024 * 1024; // 2MB对齐
-    expansion_size = (expansion_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    expansion_size = align_up(expansion_size, LARGE_PAGE_SIZE);
 
     // 最小可用大小：必须能容纳请求的分配
-    uint64_t min_size = (required_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    uint64_t min_size = align_up(required_size, LARGE_PAGE_SIZE);
 
     SHM_LOG_INFO("Attempting to expand memory pool by " << expansion_size << " bytes");
 
@@ -392,7 +402,7 @@ bool dynamic_memory_manager::expand_pool(uint64_t required_size) noexcept {
 
     for (uint64_t try_size = expansion_size;
          try_size >= min_size;
-         try_size = try_size / 2 & ~(ALIGNMENT - 1)) {
+         try_size = try_size / 2 & ~(LARGE_PAGE_SIZE - 1)) {
         ret = aclrtMalloc(&new_block_addr, try_size, ACL_MEM_MALLOC_HUGE_FIRST);
         if (ret == ACL_SUCCESS && new_block_addr != nullptr) {
             expansion_size = try_size;
@@ -581,9 +591,16 @@ void dynamic_memory_manager::update_block_statistics(dynamic_memory_block* block
 
 // 静态工具函数实现
 uint64_t dynamic_memory_manager::allocated_size_align_up(uint64_t input_size) noexcept {
-    constexpr uint64_t align_size = 16UL;
-    constexpr uint64_t align_size_mask = ~(align_size - 1UL);
-    return (input_size + align_size - 1UL) & align_size_mask;
+    if (input_size <= SMALL_ALLOC_ALIGNMENT) {
+        return SMALL_ALLOC_ALIGNMENT;
+    }
+    if (input_size <= SMALL_ALLOC_THRESHOLD) {
+        return align_up(input_size, SMALL_ALLOC_ALIGNMENT);
+    }
+    if (input_size <= MEDIUM_ALLOC_THRESHOLD) {
+        return align_up(input_size, MEDIUM_ALLOC_ALIGNMENT);
+    }
+    return align_up(input_size, LARGE_ALLOC_ALIGNMENT);
 }
 
 bool dynamic_memory_manager::alignment_matches(const memory_range &mr, uint64_t alignment, uint64_t size,
