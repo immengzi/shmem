@@ -36,22 +36,22 @@ constexpr uint32_t DEFAULT_SDMA_UB_SIZE = 64;
 constexpr int64_t DEFAULT_SDMA_UB_OFFSET = 191 * 1024;
 constexpr uint32_t DEFAULT_RDMA_UB_SIZE = 64;
 constexpr int64_t DEFAULT_RDMA_UB_OFFSET = 190 * 1024;
-constexpr int64_t LOCAL_MEM_ALIGNMENT = 2LL * 1024 * 1024;
+constexpr uint64_t LOCAL_MEM_ALIGNMENT = 2ULL * 1024 * 1024;
 
 namespace {
 
-int64_t align_up_local_mem_size(int64_t value)
+uint64_t align_up_local_mem_size(uint64_t value)
 {
     return ((value + LOCAL_MEM_ALIGNMENT - 1) / LOCAL_MEM_ALIGNMENT) *
            LOCAL_MEM_ALIGNMENT;
 }
 
-void normalize_local_mem_size(int64_t &local_mem_size)
+void normalize_local_mem_size(uint64_t &local_mem_size)
 {
-    if (local_mem_size <= 0) {
+    if (local_mem_size == 0) {
         return;
     }
-    int64_t aligned_local_mem_size = align_up_local_mem_size(local_mem_size);
+    uint64_t aligned_local_mem_size = align_up_local_mem_size(local_mem_size);
     if (aligned_local_mem_size != local_mem_size) {
         SHM_LOG_WARN("Round local_mem_size from " << local_mem_size
                      << " to " << aligned_local_mem_size
@@ -184,8 +184,9 @@ int aclshmemx_set_attr_uniqueid_args(int my_pe, int n_pes, int64_t local_mem_siz
                                     aclshmemx_init_attr_t *aclshmem_attr) {
     /* Save to uid_args */
     SHM_ASSERT_RETURN(local_mem_size > 0, ACLSHMEM_INVALID_VALUE);
-    normalize_local_mem_size(local_mem_size);
-    SHM_ASSERT_RETURN(local_mem_size <= ACLSHMEM_MAX_LOCAL_SIZE, ACLSHMEM_INVALID_VALUE);
+    uint64_t normalized_local_mem_size = static_cast<uint64_t>(local_mem_size);
+    normalize_local_mem_size(normalized_local_mem_size);
+    SHM_ASSERT_RETURN(normalized_local_mem_size <= ACLSHMEM_MAX_LOCAL_SIZE, ACLSHMEM_INVALID_VALUE);
     SHM_ASSERT_RETURN(n_pes <= ACLSHMEM_MAX_PES, ACLSHMEM_INVALID_VALUE);
     SHM_ASSERT_RETURN(my_pe < ACLSHMEM_MAX_PES, ACLSHMEM_INVALID_VALUE);
     aclshmemi_bootstrap_uid_state_t *uid_args = (aclshmemi_bootstrap_uid_state_t *)(uid);
@@ -193,7 +194,7 @@ int aclshmemx_set_attr_uniqueid_args(int my_pe, int n_pes, int64_t local_mem_siz
     aclshmem_attr->comm_args = comm_args;
     aclshmem_attr->my_pe = my_pe;
     aclshmem_attr->n_pes = n_pes;
-    aclshmem_attr->local_mem_size = local_mem_size;
+    aclshmem_attr->local_mem_size = normalized_local_mem_size;
 
     return ACLSHMEM_SUCCESS;
 }
