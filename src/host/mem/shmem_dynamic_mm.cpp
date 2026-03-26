@@ -18,11 +18,11 @@ constexpr uint64_t LARGE_PAGE_SIZE = 2ULL * 1024 * 1024;        // 2MB大页
 constexpr uint64_t MIN_EXPANSION_SIZE = 32ULL * 1024 * 1024;    // 32MB最小扩容，减少扩容抖动
 constexpr double EXPANSION_FACTOR = 1.0;                        // 精确分配，不做投机预分配
 constexpr uint64_t MAX_BLOCK_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB最大单块
-constexpr uint64_t SMALL_ALLOC_ALIGNMENT = 512ULL;
-constexpr uint64_t SMALL_ALLOC_THRESHOLD = 1ULL * 1024 * 1024;   // 1MB
-constexpr uint64_t MEDIUM_ALLOC_ALIGNMENT = LARGE_PAGE_SIZE;
-constexpr uint64_t MEDIUM_ALLOC_THRESHOLD = 16ULL * 1024 * 1024; // 16MB
-constexpr uint64_t LARGE_ALLOC_ALIGNMENT = 16ULL * 1024 * 1024;  // 16MB
+constexpr uint64_t SMALL_ALLOC_ALIGNMENT = 16ULL;
+constexpr uint64_t SMALL_ALLOC_THRESHOLD = 16ULL * 1024 * 1024;  // 16MB以下尽量保持细粒度
+constexpr uint64_t MEDIUM_ALLOC_ALIGNMENT = 64ULL * 1024;        // 64KB
+constexpr uint64_t MEDIUM_ALLOC_THRESHOLD = 64ULL * 1024 * 1024; // 64MB
+constexpr uint64_t LARGE_ALLOC_ALIGNMENT = LARGE_PAGE_SIZE;       // 真正大块再按2MB对齐
 
 inline uint64_t align_up(uint64_t value, uint64_t alignment) noexcept
 {
