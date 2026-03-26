@@ -1,14 +1,14 @@
 /**
  * @cond IGNORE_COPYRIGHT
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  * @endcond
- */
+ */
 #ifndef SHMEM_HOST_HEAP_H
 #define SHMEM_HOST_HEAP_H
 
@@ -99,6 +99,31 @@ ACLSHMEM_HOST_API void *aclshmemx_align(size_t alignment, size_t size, aclshmem_
  * @param mem_type      [in] Allocation location of the symmetric memory (Host/Device)
  */
 ACLSHMEM_HOST_API void aclshmemx_free(void *ptr, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Queue a pointer for deferred stream-ordered release. Zero ACL overhead.
+ *        The memory is not returned to the pool until aclshmem_flush_deferred_frees()
+ *        confirms the associated stream work has completed.
+ * @param ptr [in] Pointer returned by aclshmem_malloc/calloc/align.
+ */
+ACLSHMEM_HOST_API void aclshmem_defer_free(void *ptr);
+
+/**
+ * @brief Record a stream fence covering all currently queued deferred frees,
+ *        and release any previously-fenced memory whose event has completed.
+ *        Call once at the start of each aclshmem_malloc to reclaim prior-step memory
+ *        with only 1 ACL event per step (not 1 per tensor).
+ * @param stream [in] ACL stream on which preceding kernels were submitted (void* to
+ *               avoid pulling acl_rt.h into this header; cast to aclrtStream inside).
+ */
+ACLSHMEM_HOST_API void aclshmem_flush_deferred_frees(void *stream);
+
+/**
+ * @brief Synchronously drain all deferred frees (for finalization).
+ *        Blocks until all pending ACL events complete, then releases all memory.
+ */
+ACLSHMEM_HOST_API void aclshmem_drain_deferred_frees(void);
+
 #ifdef __cplusplus
 }
 #endif

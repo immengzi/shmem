@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 #include <memory>
+#include <deque>
 #include "acl/acl.h"
 #include "shmemi_host_common.h"
 #include "shmemi_mm.h"
@@ -20,6 +21,116 @@ std::shared_ptr<dynamic_memory_manager> dynamic_memory_manager_instance;  // 动
 
 // 控制是否启用动态扩容的标志
 bool enable_dynamic_expansion = true;
+
+// Batch-fence deferred-free state.
+// g_deferred_queue: freed ptrs waiting for a fence to be recorded (no ACL call yet).
+// g_fenced_queue:   freed ptrs whose fence event has been recorded; released once the event completes.
+// Using a separate mutex (not the memory-manager spinlock) because ACL event calls cannot
+// be made while holding a spinlock.
+struct DeferredFreeEntry { void *ptr; };
+std::deque<DeferredFreeEntry> g_deferred_queue;
+std::deque<DeferredFreeEntry> g_fenced_queue;
+aclrtEvent g_fence_event = nullptr;
+pthread_mutex_t g_defer_mutex = PTHREAD_MUTEX_INITIALIZER;
+}
+
+// Release a ptr back to whichever manager owns it.
+static void do_free_internal(void *ptr)
+{
+    if (enable_dynamic_expansion && dynamic_memory_manager_instance) {
+        if (dynamic_memory_manager_instance->release(ptr) == 0) return;
+    }
+    if (aclshmemi_memory_manager) {
+        auto ret = aclshmemi_memory_manager->release(ptr);
+        if (ret != 0) {
+            SHM_LOG_ERROR("do_free_internal release failed: " << ret);
+        }
+    }
+}
+
+void aclshmem_defer_free(void *ptr)
+{
+    if (ptr == nullptr) return;
+    pthread_mutex_lock(&g_defer_mutex);
+    g_deferred_queue.push_back({ptr});
+    pthread_mutex_unlock(&g_defer_mutex);
+}
+
+void aclshmem_flush_deferred_frees(void *stream_ptr)
+{
+    if (stream_ptr == nullptr) return;
+    aclrtStream stream = static_cast<aclrtStream>(stream_ptr);
+
+    // Step 1: Read the existing fence event under lock, then query outside lock.
+    pthread_mutex_lock(&g_defer_mutex);
+    aclrtEvent existing_ev = g_fence_event;
+    pthread_mutex_unlock(&g_defer_mutex);
+
+    bool completed = false;
+    if (existing_ev != nullptr) {
+        aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+        aclrtQueryEventStatus(existing_ev, &status);
+        completed = (status == ACL_EVENT_RECORDED_STATUS_COMPLETE);
+    }
+
+    // Step 2: If fence done, release fenced memory.
+    if (completed) {
+        std::deque<DeferredFreeEntry> to_release;
+        pthread_mutex_lock(&g_defer_mutex);
+        if (g_fence_event == existing_ev) {
+            to_release = std::move(g_fenced_queue);
+            g_fence_event = nullptr;
+        }
+        pthread_mutex_unlock(&g_defer_mutex);
+        aclrtDestroyEvent(existing_ev);
+        for (auto &e : to_release) do_free_internal(e.ptr);
+    }
+
+    // Step 3: Record new fence for deferred queue (only if fenced queue is now empty).
+    std::deque<DeferredFreeEntry> to_fence;
+    pthread_mutex_lock(&g_defer_mutex);
+    if (g_fenced_queue.empty() && !g_deferred_queue.empty()) {
+        to_fence = std::move(g_deferred_queue);
+    }
+    pthread_mutex_unlock(&g_defer_mutex);
+
+    if (!to_fence.empty()) {
+        aclrtEvent new_ev = nullptr;
+        aclError err = aclrtCreateEventWithFlag(&new_ev, ACL_EVENT_CAPTURE_STREAM_PROGRESS);
+        if (err == ACL_ERROR_NONE) {
+            err = aclrtRecordEvent(new_ev, stream);
+        }
+        if (err == ACL_ERROR_NONE) {
+            pthread_mutex_lock(&g_defer_mutex);
+            g_fence_event = new_ev;
+            g_fenced_queue = std::move(to_fence);
+            pthread_mutex_unlock(&g_defer_mutex);
+        } else {
+            if (new_ev != nullptr) aclrtDestroyEvent(new_ev);
+            // Fallback: sync stream then free immediately.
+            SHM_LOG_ERROR("aclshmem_flush_deferred_frees: event failed (" << err
+                          << "), falling back to stream sync");
+            aclrtSynchronizeStream(stream);
+            for (auto &e : to_fence) do_free_internal(e.ptr);
+        }
+    }
+}
+
+void aclshmem_drain_deferred_frees(void)
+{
+    pthread_mutex_lock(&g_defer_mutex);
+    aclrtEvent ev = g_fence_event;
+    g_fence_event = nullptr;
+    auto fenced   = std::move(g_fenced_queue);
+    auto deferred = std::move(g_deferred_queue);
+    pthread_mutex_unlock(&g_defer_mutex);
+
+    if (ev != nullptr) {
+        aclrtSynchronizeEvent(ev);
+        aclrtDestroyEvent(ev);
+    }
+    for (auto &e : fenced)   do_free_internal(e.ptr);
+    for (auto &e : deferred) do_free_internal(e.ptr);
 }
 
 // 新增：设置是否启用动态扩容
